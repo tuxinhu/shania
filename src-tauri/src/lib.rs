@@ -1,3 +1,4 @@
+mod browser;
 mod chat;
 mod cli_args;
 mod export;
@@ -5,6 +6,7 @@ mod settings;
 mod stt_stream;
 mod storage;
 mod tools;
+mod workspace;
 mod tts_cmd;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -391,6 +393,20 @@ pub fn run() {
             set_close_action,
             cli_args::take_cli_args,
             tools::list_tools,
+            workspace::workspace_root,
+            workspace::workspace_set,
+            workspace::workspace_list,
+            workspace::workspace_open,
+            workspace::workspace_terminal,
+            workspace::git_changes,
+            workspace::git_diff,
+            workspace::git_branch,
+            browser::browser_open,
+            browser::browser_bounds,
+            browser::browser_navigate,
+            browser::browser_script,
+            browser::browser_url,
+            browser::browser_close,
             open_logs_dir,
         ])
         .setup(|app| {

@@ -20,7 +20,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# unstable：内置浏览器要用的多 webview（Window::add_child）。这个 API 在 Tauri 2
+# 里仍标 unstable，但 Windows 上已经稳定可用；不用它就只剩 iframe 一条路，
+# 而 iframe 会被绝大多数站点的 X-Frame-Options 挡掉。
+tauri = { version = "2", features = ["tray-icon", "image-png", "unstable"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"

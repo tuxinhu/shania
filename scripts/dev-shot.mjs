@@ -67,9 +67,11 @@ async function evaluate(expression) {
 }
 
 await send('Page.enable')
+// 视口尺寸走环境变量，方便在大窗口下检查留白（如 SHOT_W=1706 SHOT_H=1066 模拟
+// 2560x1600 屏 150% 缩放后最大化时的 CSS 尺寸）
 await send('Emulation.setDeviceMetricsOverride', {
-  width: 1200,
-  height: 800,
+  width: Number(process.env.SHOT_W || 1200),
+  height: Number(process.env.SHOT_H || 800),
   deviceScaleFactor: 1,
   mobile: false,
 })
@@ -102,6 +104,16 @@ if (mode === 'settings' || mode.startsWith('settings:')) {
     )
     await sleep(500)
   }
+}
+
+// rail:浏览器 / rail:工作空间 / rail:变更 —— 按按钮 title 匹配右侧工具条
+if (mode.startsWith('rail:')) {
+  const label = mode.split(':')[1]
+  await evaluate(
+    `[...document.querySelectorAll('.rail-btn')]` +
+      `.find((b) => b.title.includes(${JSON.stringify(label)}))?.click()`,
+  )
+  await sleep(900)
 }
 
 fs.mkdirSync(path.dirname(outFile), { recursive: true })

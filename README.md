@@ -71,6 +71,18 @@ WebView2 与托盘。拆开后 CLI 二进制只含 reqwest + serde，Agent 逻�
 - 系统托盘常驻（显示主窗口〔带当前快捷键〕/ 新建对话 / 设置 / 打开配置目录 / 退出）
 - 开机自启（autostart 插件）
 
+### 右侧工作区
+主界面最右一条竖排工具条（浏览器 / 工作空间 / 变更 / 终端），点开在右侧推开 420px 面板：
+- **内置浏览器**：不是 iframe，是 Tauri 多 webview（`Window::add_child`，需要 `unstable` feature）
+  真渲染网页，iframe 被站点 X-Frame-Options 挡掉的问题不存在。地址栏补全（补 https、
+  非地址走必应搜索），前进/后退/刷新；子 webview 坐标由前端 `ResizeObserver` 上报，
+  缩放/最大化都不错位。约束：子 webview 永远盖在 HTML 之上，浮层不能压在它上面
+- **工作空间**：可切换的根目录（写 `settings.json` 的 `workspacePath`，CLI 共用），
+  懒加载文件树（跳过 .git/node_modules/target 等），点文件交给系统关联程序打开
+- **变更**：`git status --porcelain` 列表（分支名 + 新/增/修/删徽章），点条目看单文件
+  `git diff HEAD`，未跟踪文件直接展示全文；git 走 CLI 而不是 libgit2，零新增编译负担
+- **终端**：拉起系统终端（Windows Terminal 优先，缺了退 cmd），工作目录 = 工作空间
+
 ### 设置与交付
 - **设置是整页不是弹窗**：左导航 + 右内容，六个模块——通用 / 模型 / 人设 / 语音 / 工具 / 数据与关于；
   正文限宽 720px 居中，标题与表单同轴对齐，`Esc` 或右上「完成」返回会话（记住上次停在哪页）

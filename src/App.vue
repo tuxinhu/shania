@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
 import ChatPanel from '@/components/ChatPanel.vue'
+import RightRail from '@/components/RightRail.vue'
 import SettingsPage from '@/components/SettingsPage.vue'
 import SidebarPanel from '@/components/SidebarPanel.vue'
 import {
@@ -131,6 +132,7 @@ onUnmounted(() => {
     <div v-show="!settingsOpen" class="screen">
       <SidebarPanel @open-settings="settingsOpen = true" />
       <ChatPanel @open-settings="settingsOpen = true" />
+      <RightRail />
     </div>
     <SettingsPage v-if="settingsOpen" @close="settingsOpen = false" />
   </div>

@@ -62,6 +62,14 @@ const paths: Record<string, string> = {
     '<path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/><path d="m3 17.5 9 5 9-5"/>',
   closeCircle:
     '<circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/>',
+  terminal: '<path d="m5 7.5 4.2 4.5L5 16.5"/><path d="M12.8 17h6.2"/>',
+  git: '<circle cx="6.2" cy="5.6" r="2.2"/><circle cx="6.2" cy="18.4" r="2.2"/><circle cx="17.8" cy="9.4" r="2.2"/><path d="M6.2 7.8v8.4"/><path d="M17.8 11.6c0 3.6-3.4 4.6-6.2 4.9H8.4"/>',
+  chevronRight: '<path d="m9.5 6.5 5.5 5.5-5.5 5.5"/>',
+  arrowLeft: '<path d="M19.5 12h-15"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/>',
+  arrowRight: '<path d="M4.5 12h15"/><path d="m13 5.5 6.5 6.5-6.5 6.5"/>',
+  external:
+    '<path d="M13.5 4H20v6.5"/><path d="M20 4 11 13"/><path d="M18.5 14.5V19a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2H10"/>',
+  home: '<path d="m3 10.6 9-7.1 9 7.1"/><path d="M5.6 9.4V20h12.8V9.4"/>',
 }
 </script>
 
