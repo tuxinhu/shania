@@ -72,9 +72,7 @@ onMounted(async () => {
       const wire = buildWire(chat.messages, settingsStore.settings.contextLimit)
       return [...wire, { role: 'user', content: userText }]
     },
-    sid: settingsStore.settings.ttsSid,
     speed: settingsStore.settings.ttsSpeed,
-    model: settingsStore.settings.ttsModel,
     onState: (s) => {
       state.value = s
     },

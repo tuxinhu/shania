@@ -233,7 +233,7 @@ export class AudioEngine {
    * 把一段合成好的 PCM 排进播放队列。
    *
    * `pcm` 是 base64 的小端 i16（Rust 侧 `Audio::to_pcm_base64` 的输出），
-   * `rate` 是这段音频自己的采样率（Kokoro 是 24k）。
+   * `rate` 是这段音频自己的采样率（MeloTTS 是 44.1k）。
    *
    * AudioBuffer 的采样率不必等于上下文采样率——Chromium 播放时会自动重采样。
    */

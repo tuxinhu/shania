@@ -17,7 +17,7 @@ mod simplify_table;
 /// （命令行二进制会从几 MB 涨到几十 MB），而 CLI 根本用不到语音输入。
 #[cfg(feature = "stream-stt")]
 pub mod stream_stt;
-/// 本地语音合成（Kokoro，sherpa-onnx `OfflineTts`，进程内推理）。
+/// 本地语音合成（MeloTTS，sherpa-onnx `OfflineTts`，进程内推理）。
 ///
 /// 和 `stream_stt` 绑在同一个 feature 上：两者共用 onnxruntime，
 /// 分开开关没有意义，还会让 DLL 部署出现「有一半没一半」的状态。

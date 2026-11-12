@@ -65,9 +65,6 @@ export type ThemeMode = 'system' | 'light' | 'dark'
 /** 关闭主窗口时的行为：收起到托盘，或直接退出应用 */
 export type CloseAction = 'tray' | 'quit'
 
-/** 语音合成模型的选择（`auto` 由后端按可用性挑，matcha 优先） */
-export type TtsModel = 'auto' | 'melo' | 'matcha' | 'kokoro'
-
 /** 一套可保存的模型接入配置 */
 export interface ModelProfile {
   id: string
@@ -99,20 +96,8 @@ export interface AppSettings {
   contextLimit: number
   /** 程序启动时就把语音模型读进内存（加载要几秒）；关掉则退化为点麦克风时才加载 */
   sttPreload: boolean
-  /** 语音合成的音色编号（只有 Kokoro 有多个音色，编号随模型版本变化） */
-  ttsSid: number
   /** 语音合成的语速，0.5-2.0，1 为原速 */
   ttsSpeed: number
-  /**
-   * 用哪个合成模型。
-   * - `auto`：装了哪个用哪个，melo 优先
-   * - `melo`：中英混读、44.1kHz、单音色，RTF 0.32——中英混排的通话首选
-   * - `matcha`：最快（RTF 0.06）、中文最稳，但一个英文都不认得
-   * - `kokoro`：103 音色、音质更好，但 RTF 0.5，通话首声会慢到 1.8 秒
-   *
-   * 指定的模型没装时自动回退，不会变成没声音。
-   */
-  ttsModel: TtsModel
   /** 已保存的模型配置 */
   profiles: ModelProfile[]
   /** 当前生效配置对应的 profile id（手动改过参数则为空） */

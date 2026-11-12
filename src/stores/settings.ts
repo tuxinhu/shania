@@ -25,21 +25,32 @@ const DEFAULTS: AppSettings = {
   autoStart: false,
   contextLimit: 32000,
   sttPreload: true,
-  ttsSid: 0,
   ttsSpeed: 1,
-  ttsModel: 'auto',
   profiles: [],
   activeProfileId: '',
 }
 
 /**
- * 已经废弃的设置项：whisper 引擎的端口/地址/后端/语言，以及引擎选择本身。
+ * 已经废弃的设置项。
  *
- * 语音输入统一走 X-ASR 之后这些都没有意义了。解析时直接丢掉，否则它们会随着
- * 「整对象写回」一直留在 `settings.json` 里——用户打开文件看到一堆不起作用的
- * 字段，只会以为程序还在用它。
+ * - `sttModel` / `sttBaseUrl` / `sttPort` / `sttBackend` / `sttLanguage` / `sttEngine`：
+ *   语音输入统一走 X-ASR 之后没有意义
+ * - `ttsModel` / `ttsSid`：合成模型只留 MeloTTS 一个、且只有单音色，选择器和
+ *   音色编号都不再需要
+ *
+ * 解析时直接丢掉，否则它们会随着「整对象写回」一直留在 `settings.json` 里——
+ * 用户打开文件看到一堆不起作用的字段，只会以为程序还在用它。
  */
-const OBSOLETE_KEYS = ['sttModel', 'sttBaseUrl', 'sttPort', 'sttBackend', 'sttLanguage', 'sttEngine']
+const OBSOLETE_KEYS = [
+  'sttModel',
+  'sttBaseUrl',
+  'sttPort',
+  'sttBackend',
+  'sttLanguage',
+  'sttEngine',
+  'ttsModel',
+  'ttsSid',
+]
 
 function parse(raw: string | null): AppSettings {
   if (!raw) return { ...DEFAULTS, profiles: [] }

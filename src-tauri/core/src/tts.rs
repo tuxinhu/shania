@@ -1,21 +1,19 @@
-//! 本地语音合成：进程内 ONNX 推理，三种模型按可用性自动选择。
+//! 本地语音合成：进程内 ONNX 推理（sherpa-onnx `OfflineTts`），不需要外部进程。
 //!
-//! # 三个模型，用途不同
+//! # 为什么是 MeloTTS
 //!
-//! | 模型 | 大小 | 实测 RTF | 音色 | 特点 |
-//! |---|---|---|---|---|
-//! | vits-melo-tts-zh_en | 170MB | 0.32 | 1 个女声 | **默认**，中英混读，44.1kHz |
-//! | matcha-icefall-zh-baker | 72+54MB | **0.04** | 1 个女声 | 最快，但一个英文都不认得 |
-//! | kokoro-multi-lang-v1_1 | 348MB | 0.50 | 103 个 | 音色多，中文词表残缺 |
+//! 用的是 `vits-melo-tts-zh_en`：170MB、44.1kHz、单音色、实测 RTF 0.32-0.43。
 //!
-//! 默认走 melo：它是这三个里唯一「中文准、英文也念得出来」的。matcha 快 8 倍，
-//! 但送英文进去返回 0 采样——不是念错，是完全不出声，中英混排的句子会中间空
-//! 一截。通话语境里「内容完整」比「快 0.4 秒」重要。
+//! 前后试过的另外两个（代码已删，模型文件还在 `~/.shania/models/` 下）：
 //!
-//! Kokoro 的 103 个音色留着给朗读长文用，通话不推荐（首声 1.8 秒）。
+//! | 模型 | 实测 | 为什么不用 |
+//! |---|---|---|
+//! | matcha-icefall-zh-baker | RTF 0.04，最快 | lexicon 里**一个英文词都没有**，送英文进去返回 0 采样——不是念错，是完全不出声，中英混排的句子中间会空一截 |
+//! | kokoro-multi-lang-v1_1 | RTF 0.50，103 音色 | 中文按词查注音表，表外的「好的」「我看了下」念成英文音；首声 1.8 秒 |
 //!
-//! 探测顺序 melo 优先。用户在设置里指定了模型时按用户的来（[`choose`]），
-//! 指定的那个没装就退回自动，不会变成「没声音」。
+//! melo 是唯一「中文准、英文也念得出来」的：lexicon 11.2 万条含中英音素，
+//! 表外的缩写（API / JSON / GPU）按字母念。代价是比 matcha 慢（首声 1.3 秒
+//! vs 0.9 秒），通话语境里「内容完整」比「快 0.4 秒」重要。
 //!
 //! # 为什么整句合成而不是流式回调
 //!
@@ -25,61 +23,30 @@
 //!
 //! # 换后端
 //!
-//! [`Speech`] 是留给以后接云 TTS 的扩展点：调用方只依赖 trait，换实现不用改
-//! 通话状态机。
+//! 合成入口是 [`Engine::say`]：接云 TTS 时在这里分流即可，`Loaded` 那层
+//! 只管本地 ONNX 的细节。
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use sherpa_onnx::{
-    GenerationConfig, OfflineTts, OfflineTtsConfig, OfflineTtsKokoroModelConfig,
-    OfflineTtsMatchaModelConfig, OfflineTtsModelConfig,
-};
+use sherpa_onnx::{GenerationConfig, OfflineTts, OfflineTtsConfig, OfflineTtsModelConfig};
 
 use crate::stream_stt::{pick, scan};
 
 pub const MELO_DIR: &str = "vits-melo-tts-zh_en";
-pub const MATCHA_DIR: &str = "matcha-icefall-zh-baker";
-pub const KOKORO_DIR: &str = "kokoro-multi-lang-v1_1";
 
-/// melo 的压缩包（163MB，解压 170MB 的 fp32 模型）
+/// 压缩包大小（163MB，解压出 170MB 的 fp32 声学模型）
 ///
 /// 包里还有一个 `model.int8.onnx`，只有 **133 字节**——那是 git-lfs 的指针
 /// 文件，不是模型。挑文件时必须点名 `model.onnx`，否则加载的是它，报「模型
-/// 与 sherpa-onnx 版本不匹配」。
+/// 与 sherpa-onnx 版本不匹配」，几乎查不出来。
 pub const MELO_BYTES: u64 = 167_006_755;
-/// matcha 的声学模型包
-pub const MATCHA_BYTES: u64 = 75_455_508;
-/// matcha 的声码器（单独发布，不在压缩包里）
-pub const VOCODER_BYTES: u64 = 53_884_024;
-/// kokoro 的压缩包
-pub const KOKORO_BYTES: u64 = 364_855_331;
 
-const MATCHA_URL: &str =
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/matcha-icefall-zh-baker.tar.bz2";
-const VOCODER_URL: &str =
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos-22khz-univ.onnx";
-const VOCODER_NAME: &str = "vocos-22khz-univ.onnx";
-
-/// 声码器在模型目录里的文件名（下载和查找共用这一个名字）
-pub fn vocoder_name() -> &'static str {
-    VOCODER_NAME
-}
-
-const KOKORO_URL: &str =
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_1.tar.bz2";
 const MELO_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-melo-tts-zh_en.tar.bz2";
 
 /// 允许用镜像覆盖（国内直连 GitHub 经常只有几十 KB/s）
-pub fn matcha_url() -> String {
-    std::env::var("SHANIA_TTS_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| MATCHA_URL.to_string())
-}
-
 pub fn melo_url() -> String {
     std::env::var("SHANIA_TTS_MELO_URL")
         .ok()
@@ -87,180 +54,47 @@ pub fn melo_url() -> String {
         .unwrap_or_else(|| MELO_URL.to_string())
 }
 
-pub fn vocoder_url() -> String {
-    std::env::var("SHANIA_TTS_VOCODER_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| VOCODER_URL.to_string())
+/// 合成时开多少线程。
+///
+/// 声学模型是自回归结构，单步慢，核给少了就是在干等——实测 4 线程 RTF 0.50、
+/// 8 线程 0.40，再多收益就平了。开满会跟 X-ASR 抢 CPU，而识别卡顿比合成慢
+/// 更影响通话。
+fn threads() -> i32 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4);
+    (cores / 2).clamp(4, 10)
 }
 
-pub fn kokoro_url() -> String {
-    std::env::var("SHANIA_TTS_KOKORO_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| KOKORO_URL.to_string())
-}
+/// 输出归一化的目标峰值。
+///
+/// melo 的原始峰值只有 0.07-0.25，matcha 是 0.60——同样把系统音量开满，听感
+/// 差一个数量级，用户第一反应是「这个模型坏了」。按句归一化到 0.85，而不是
+/// 乘固定倍数：乘 4 会让本来就有 0.25 的句子撞到 1.0 削波（实测长句和带
+/// markdown 的那句都满了），削波听起来是「滋」的一声。
+const TARGET_PEAK: f32 = 0.85;
 
-/// 用哪种模型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Melo,
-    Matcha,
-    Kokoro,
-}
+/// 超过这个耗时就在日志里记一条（正常 20 字约 1.3 秒）
+const SLOW_MS: u128 = 2500;
 
-impl Kind {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Kind::Melo => "MeloTTS（中英混，单音色）",
-            Kind::Matcha => "Matcha（最快，单音色，不会英文）",
-            Kind::Kokoro => "Kokoro（慢，103 音色）",
-        }
-    }
-
-    pub fn dir_name(&self) -> &'static str {
-        match self {
-            Kind::Melo => MELO_DIR,
-            Kind::Matcha => MATCHA_DIR,
-            Kind::Kokoro => KOKORO_DIR,
-        }
-    }
-
-    /// 存进 `settings.json` 的标识
-    pub fn id(&self) -> &'static str {
-        match self {
-            Kind::Melo => "melo",
-            Kind::Matcha => "matcha",
-            Kind::Kokoro => "kokoro",
-        }
-    }
-
-    pub fn from_id(s: &str) -> Option<Kind> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "melo" | "melotts" => Some(Kind::Melo),
-            "matcha" => Some(Kind::Matcha),
-            "kokoro" => Some(Kind::Kokoro),
-            _ => None,
-        }
-    }
-
-    /// 压缩包大小，下载完拿来校验，防止存到半截文件或错误页
-    pub fn archive_bytes(&self) -> u64 {
-        match self {
-            Kind::Melo => MELO_BYTES,
-            Kind::Matcha => MATCHA_BYTES,
-            Kind::Kokoro => KOKORO_BYTES,
-        }
-    }
-
-    /// 合成时开多少线程。
-    ///
-    /// melo 的声学模型是自回归结构，单步慢，核给少了就是在干等——实测 4 线程
-    /// RTF 0.50、8 线程 0.40，再多收益就平了。另外两个是前馈模型，2-4 线程
-    /// 已经够，开满只会跟 X-ASR 抢 CPU（识别卡顿比合成慢更影响通话）。
-    fn threads(&self) -> i32 {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4);
-        match self {
-            Kind::Melo => (cores / 2).clamp(4, 10),
-            _ => cores.clamp(2, 4),
-        }
-    }
-
-    /// 目标峰值：`None` 表示原样输出。
-    ///
-    /// melo 的峰值只有 0.07-0.25，matcha 是 0.60——同样把系统音量开满，听感
-    /// 差一个数量级，用户第一反应是「这个模型坏了」。按句归一化到 0.85，
-    /// 而不是乘一个固定倍数：固定 4 倍会让本来就有 0.25 的句子撞到 1.0 削波
-    /// （实测「长句」和带 markdown 的那句都满了），削波听起来是「滋」的一声，
-    /// 比声音小难听得多。
-    fn target_peak(&self) -> Option<f32> {
-        match self {
-            Kind::Melo => Some(0.85),
-            _ => None,
-        }
-    }
-
-    /// 超过这个耗时就在日志里记一条（超过正常水平＝机器在忙或选错了模型）
-    fn slow_ms(&self) -> u128 {
-        match self {
-            Kind::Melo => 2500,
-            Kind::Matcha => 800,
-            Kind::Kokoro => 3000,
-        }
-    }
-}
-
-pub fn dir(root: &Path, kind: Kind) -> PathBuf {
-    root.join("models").join(kind.dir_name())
+pub fn dir(root: &Path) -> PathBuf {
+    root.join("models").join(MELO_DIR)
 }
 
 /// 解压后真正要喂给合成器的文件
 #[derive(Debug, Clone)]
 pub struct Files {
-    pub kind: Kind,
-    /// 声学模型（matcha 是 model-steps-3.onnx，kokoro 是 model.onnx）
     pub model: PathBuf,
     pub tokens: PathBuf,
-    /// matcha 用单个 lexicon.txt；kokoro 是中英双语，逗号拼两本
-    pub lexicon: String,
-    /// 英文词表（只有 kokoro 有）。合成前拿它判断哪些英文词念得出来。
-    pub english: Option<PathBuf>,
+    pub lexicon: PathBuf,
     pub rule_fsts: Option<String>,
-    /// kokoro 独有：音色向量表
-    pub voices: Option<PathBuf>,
-    /// matcha 独有：声码器、jieba 词典
-    pub vocoder: Option<PathBuf>,
+    /// jieba 词典，缺了中文分词会退化
     pub dict_dir: Option<PathBuf>,
 }
 
-/// 找可用的模型，matcha 优先。
+/// 模型完整可用时返回文件清单
 pub fn files(root: &Path) -> Option<Files> {
-    files_for(root, choose(root, None)?)
-}
-
-/// 指定模型的可用文件，没装完整则返回 None。
-pub fn files_for(root: &Path, kind: Kind) -> Option<Files> {
-    match kind {
-        Kind::Melo => melo_files(root),
-        Kind::Matcha => matcha_files(root),
-        Kind::Kokoro => kokoro_files(root),
-    }
-}
-
-/// 这一轮该用哪个模型。
-///
-/// `prefer` 来自设置里的 `ttsModel`（`auto` / `melo` / `matcha` / `kokoro`）。
-/// 指定的那个没装就退回自动——否则用户点「只用 Melo」却没下模型，会从
-/// 「音质差一点」变成「完全不出声」。
-pub fn choose(root: &Path, prefer: Option<Kind>) -> Option<Kind> {
-    if let Some(kind) = prefer {
-        if files_for(root, kind).is_some() {
-            return Some(kind);
-        }
-    }
-    [Kind::Melo, Kind::Matcha, Kind::Kokoro]
-        .into_iter()
-        .find(|k| files_for(root, *k).is_some())
-}
-
-pub fn ready(root: &Path) -> bool {
-    files(root).is_some()
-}
-
-/// 指定模型的目录占用
-pub fn size(root: &Path, kind: Kind) -> u64 {
-    let mut all = Vec::new();
-    scan(&dir(root, kind), &mut all, 0);
-    all.iter()
-        .filter_map(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len())
-        .sum()
-}
-
-fn melo_files(root: &Path) -> Option<Files> {
-    let base = dir(root, Kind::Melo);
+    let base = dir(root);
     let mut all = Vec::new();
     scan(&base, &mut all, 0);
     if all.is_empty() {
@@ -268,14 +102,14 @@ fn melo_files(root: &Path) -> Option<Files> {
     }
 
     // 点名 model.onnx：包里同时有一个 133 字节的 model.int8.onnx（git-lfs 指针），
-    // 按关键词模糊匹配可能挑到它，加载时只报「版本不匹配」，很难查
+    // 按关键词模糊匹配可能挑到它
     let model = all
         .iter()
         .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("model.onnx"))
         .cloned()
         .or_else(|| pick(&all, "model", ".onnx"))?;
     let tokens = pick(&all, "tokens", ".txt")?;
-    let lexicon = pick(&all, "lexicon", ".txt")?.display().to_string();
+    let lexicon = pick(&all, "lexicon", ".txt")?;
 
     // 四个 FST 各有分工：数字、日期、电话号码，以及 new_heteronym（多音字，
     // 「银行/行走」这类）。少一个不会崩，但那类词会念错
@@ -288,121 +122,30 @@ fn melo_files(root: &Path) -> Option<Files> {
     let dict = base.join("dict");
 
     Some(Files {
-        kind: Kind::Melo,
         model,
         tokens,
         lexicon,
-        // melo 不走白名单：见 Latin::Keep 的说明
-        english: None,
         rule_fsts: if fsts.is_empty() {
             None
         } else {
             Some(fsts.join(","))
         },
-        voices: None,
-        vocoder: None,
         dict_dir: if dict.is_dir() { Some(dict) } else { None },
     })
 }
 
-fn matcha_files(root: &Path) -> Option<Files> {
-    let base = dir(root, Kind::Matcha);
-    let mut all = Vec::new();
-    scan(&base, &mut all, 0);
-    if all.is_empty() {
-        return None;
-    }
-
-    let model = pick(&all, "model", ".onnx")?;
-    let vocoder = pick(&all, "vocos", ".onnx")?;
-    let tokens = pick(&all, "tokens", ".txt")?;
-    let lexicon = pick(&all, "lexicon", ".txt")?.display().to_string();
-
-    // 三个 FST 都在包里：数字、日期、电话号码的读法全靠它们
-    let fsts: Vec<String> = ["phone", "date", "number"]
-        .into_iter()
-        .filter_map(|name| pick(&all, name, ".fst"))
-        .map(|p| p.display().to_string())
-        .collect();
-
-    // jieba 词典，缺了中文分词会退化但还能跑
-    let dict = base.join("dict");
-
-    Some(Files {
-        kind: Kind::Matcha,
-        model,
-        tokens,
-        lexicon,
-        english: None,
-        rule_fsts: if fsts.is_empty() {
-            None
-        } else {
-            Some(fsts.join(","))
-        },
-        voices: None,
-        vocoder: Some(vocoder),
-        dict_dir: if dict.is_dir() { Some(dict) } else { None },
-    })
+pub fn ready(root: &Path) -> bool {
+    files(root).is_some()
 }
 
-fn kokoro_files(root: &Path) -> Option<Files> {
-    let base = dir(root, Kind::Kokoro);
+/// 模型目录占用
+pub fn size(root: &Path) -> u64 {
     let mut all = Vec::new();
-    scan(&base, &mut all, 0);
-    if all.is_empty() {
-        return None;
-    }
-
-    let model = all
-        .iter()
-        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("model.onnx"))
-        .cloned()
-        .or_else(|| pick(&all, "model", ".onnx"))?;
-    let voices = pick(&all, "voices", ".bin")?;
-    let tokens = pick(&all, "tokens", ".txt")?;
-
-    // 中英混排模型，两个 lexicon 都要给：只给中文时英文单词会被逐字母念
-    let en = pick(&all, "lexicon-us-en", ".txt").or_else(|| pick(&all, "lexicon-en", ".txt"));
-    let zh = pick(&all, "lexicon-zh", ".txt");
-    let lexicon = match (&en, &zh) {
-        (Some(a), Some(b)) => format!("{},{}", a.display(), b.display()),
-        (Some(a), None) => a.display().to_string(),
-        (None, Some(b)) => b.display().to_string(),
-        (None, None) => return None,
-    };
-
-    // 三个都要：漏了 number-zh 时阿拉伯数字会被 lexicon 判成 OOV 直接吞掉，
-    // 听感是「成功率比上个月提高了 个百分点」——中间那个数整个消失。
-    let fsts: Vec<String> = [
-        pick(&all, "phone-zh", ".fst"),
-        pick(&all, "date-zh", ".fst"),
-        pick(&all, "number-zh", ".fst"),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|p| p.display().to_string())
-    .collect();
-
-    // 词表和分词词典：dict 里有 jieba 的用户词典，缺了会把整句当成一个词，
-    // 于是 lexicon 全查不到、退回按拼音念——「我看了下」念成「Well, can less」
-    let dict = base.join("dict");
-
-    // voices.bin 是 kokoro 的核心资产，加载时单独取
-    Some(Files {
-        kind: Kind::Kokoro,
-        model,
-        tokens,
-        lexicon,
-        english: en,
-        rule_fsts: if fsts.is_empty() {
-            None
-        } else {
-            Some(fsts.join(","))
-        },
-        voices: Some(voices),
-        vocoder: None,
-        dict_dir: if dict.is_dir() { Some(dict) } else { None },
-    })
+    scan(&dir(root), &mut all, 0);
+    all.iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
 }
 
 /// 一段合成好的音频
@@ -436,22 +179,10 @@ impl Audio {
     }
 }
 
-/// 语音合成后端。换云 TTS 时实现这个 trait 即可，调用方不用动。
-pub trait Speech: Send + Sync {
-    fn say(&self, text: &str, sid: i32, speed: f32) -> Result<Audio, String>;
-    fn num_speakers(&self) -> i32;
-    fn sample_rate(&self) -> i32;
-}
-
 struct Loaded {
     tts: OfflineTts,
     rate: i32,
     speakers: i32,
-    kind: Kind,
-    /// 念得出哪些英文词
-    latin: Latin,
-    /// 归一化目标峰值（melo 的原始输出太小），`None` 表示原样输出
-    target_peak: Option<f32>,
 }
 
 impl Loaded {
@@ -460,11 +191,9 @@ impl Loaded {
         self.tts
             .generate_with_config(text, config, None::<fn(&[f32], f32) -> bool>)
     }
-}
 
-impl Speech for Loaded {
     fn say(&self, text: &str, sid: i32, speed: f32) -> Result<Audio, String> {
-        let clean = sanitize_with(text, &self.latin);
+        let clean = sanitize(text);
         // 纯标点（「……」「——」「。。。」）没有可念的字。这不是故障：
         // 分句器和模型都会偶尔吐这种东西，报错会让通话中断在半句话上。
         if !speakable(&clean) {
@@ -508,26 +237,23 @@ impl Speech for Loaded {
                 rate: self.rate,
             });
         };
+
         let mut samples = audio.samples().to_vec();
-        if let Some(target) = self.target_peak {
-            let peak = samples.iter().fold(0.0f32, |a, x| a.max(x.abs()));
-            if peak > 0.001 {
-                // 上限 10 倍：极安静的句子放大到 0.85 就够，再往上只会把底噪也拉起来
-                let gain = (target / peak).clamp(1.0, 10.0);
-                for s in &mut samples {
-                    *s = (*s * gain).clamp(-1.0, 1.0);
-                }
+        let peak = samples.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+        if peak > 0.001 {
+            // 上限 10 倍：极安静的句子放大到 0.85 就够，再往上只会把底噪也拉起来
+            let gain = (TARGET_PEAK / peak).clamp(1.0, 10.0);
+            for s in &mut samples {
+                *s = (*s * gain).clamp(-1.0, 1.0);
             }
         }
 
-        // 慢到这个程度说明机器在忙，或者模型选错了
         let elapsed = began.elapsed();
-        if elapsed.as_millis() > self.kind.slow_ms() as u128 {
+        if elapsed.as_millis() > SLOW_MS {
             crate::log_warn!(
-                "TTS 合成偏慢：{} 字用了 {}ms（{}，{} 采样）",
+                "TTS 合成偏慢：{} 字用了 {}ms（{} 采样）",
                 clean.chars().count(),
                 elapsed.as_millis(),
-                self.kind.label(),
                 samples.len()
             );
         }
@@ -538,13 +264,6 @@ impl Speech for Loaded {
         })
     }
 
-    fn num_speakers(&self) -> i32 {
-        self.speakers
-    }
-
-    fn sample_rate(&self) -> i32 {
-        self.rate
-    }
 }
 
 /// 合成器常驻容器。
@@ -572,52 +291,27 @@ impl Engine {
         self.inner.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
-    /// 加载后的 (采样率, 音色数, 模型种类)。没加载时返回 None。
-    pub fn info(&self) -> Option<(i32, i32, Kind)> {
+    /// 加载后的 (采样率, 音色数)。没加载时返回 None。
+    pub fn info(&self) -> Option<(i32, i32)> {
         let guard = self.inner.lock().ok()?;
-        guard.as_ref().map(|k| (k.rate, k.speakers, k.kind))
+        guard.as_ref().map(|k| (k.rate, k.speakers))
     }
 
     /// 加载模型。已经加载过就直接返回，不读盘。
-    ///
-    /// `prefer` 换了模型时会重载：把旧的丢掉再按新的建。切换不可能高频，
-    /// 而两个模型同时在内存里要多占 350MB，不值得留。
-    pub fn start(&self, root: &Path, prefer: Option<Kind>) -> Result<(), String> {
+    pub fn start(&self, root: &Path) -> Result<(), String> {
         let mut guard = self.inner.lock().map_err(|_| "合成器状态锁失效".to_string())?;
-
-        let want = choose(root, prefer).ok_or_else(|| "语音合成模型还没装好".to_string())?;
-        if let Some(current) = guard.as_ref() {
-            if current.kind == want {
-                return Ok(());
-            }
-            crate::log_info!(
-                "语音合成模型切换：{} → {}",
-                current.kind.label(),
-                want.label()
-            );
-            *guard = None;
+        if guard.is_some() {
+            return Ok(());
         }
 
-        let files = files_for(root, want).ok_or_else(|| "语音合成模型还没装好".to_string())?;
+        let files = files(root).ok_or_else(|| "语音合成模型还没装好".to_string())?;
         let began = Instant::now();
 
-        // 英文处理：kokoro 有 17.8 万词的英文 lexicon，只有表里的词念得对；
-        // matcha 一行英文都没有，全删；melo 自己就是中英混，全留
-        let latin = match files.kind {
-            Kind::Melo => Latin::Keep,
-            Kind::Matcha => Latin::Drop,
-            Kind::Kokoro => match &files.english {
-                Some(path) => Latin::Allow(load_words(path)),
-                None => Latin::Drop,
-            },
-        };
-
-        let threads = files.kind.threads();
-        let model_config = match files.kind {
-            Kind::Melo => OfflineTtsModelConfig {
+        let config = OfflineTtsConfig {
+            model: OfflineTtsModelConfig {
                 vits: sherpa_onnx::OfflineTtsVitsModelConfig {
                     model: Some(files.model.to_string_lossy().to_string()),
-                    lexicon: Some(files.lexicon.clone()),
+                    lexicon: Some(files.lexicon.to_string_lossy().to_string()),
                     tokens: Some(files.tokens.to_string_lossy().to_string()),
                     dict_dir: files
                         .dict_dir
@@ -630,63 +324,10 @@ impl Engine {
                     length_scale: 1.0,
                     ..Default::default()
                 },
-                num_threads: threads,
+                num_threads: threads(),
                 debug: false,
                 ..Default::default()
             },
-            Kind::Matcha => {
-                let vocoder = files
-                    .vocoder
-                    .as_ref()
-                    .ok_or_else(|| "matcha 缺少声码器 vocos-22khz-univ.onnx".to_string())?;
-                OfflineTtsModelConfig {
-                    matcha: OfflineTtsMatchaModelConfig {
-                        acoustic_model: Some(files.model.to_string_lossy().to_string()),
-                        vocoder: Some(vocoder.to_string_lossy().to_string()),
-                        tokens: Some(files.tokens.to_string_lossy().to_string()),
-                        lexicon: Some(files.lexicon.clone()),
-                        dict_dir: files
-                            .dict_dir
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().to_string()),
-                        noise_scale: 0.667,
-                        length_scale: 1.0,
-                        ..Default::default()
-                    },
-                    num_threads: threads,
-                    debug: false,
-                    ..Default::default()
-                }
-            }
-            Kind::Kokoro => {
-                let voices = files
-                    .voices
-                    .as_ref()
-                    .ok_or_else(|| "kokoro 缺少 voices.bin".to_string())?;
-                OfflineTtsModelConfig {
-                    kokoro: OfflineTtsKokoroModelConfig {
-                        model: Some(files.model.to_string_lossy().to_string()),
-                        voices: Some(voices.to_string_lossy().to_string()),
-                        tokens: Some(files.tokens.to_string_lossy().to_string()),
-                        lexicon: Some(files.lexicon.clone()),
-                        // lang 在 v2.0.0 起已废弃（espeak 不再参与），语言由
-                        // lexicon 决定，这里不再传。
-                        dict_dir: files
-                            .dict_dir
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().to_string()),
-                        length_scale: 1.0,
-                        ..Default::default()
-                    },
-                    num_threads: threads,
-                    debug: false,
-                    ..Default::default()
-                }
-            }
-        };
-
-        let config = OfflineTtsConfig {
-            model: model_config,
             rule_fsts: files.rule_fsts.clone(),
             ..Default::default()
         };
@@ -702,17 +343,13 @@ impl Engine {
             tts,
             rate,
             speakers,
-            kind: files.kind,
-            latin,
-            target_peak: files.kind.target_peak(),
         });
 
         crate::log_info!(
-            "语音合成器就绪：{}ms，{} 音色，{}Hz，{}",
+            "语音合成器就绪：{}ms，{} 音色，{}Hz",
             began.elapsed().as_millis(),
             speakers,
-            rate,
-            files.kind.label()
+            rate
         );
         Ok(())
     }
@@ -742,60 +379,11 @@ impl Engine {
 /// 主要是防 markdown：模型偶尔会不听招呼吐 `**强调**` 或反引号，直接喂进
 /// 合成器会被念成「星号星号」。通话模式虽然另外下了 prompt 约束，但这一层
 /// 不能省——prompt 是概率性的，清洗是确定的。
-/// 拉丁字母的处理策略。
 ///
-/// 中文模型念不出英文：matcha 的 lexicon 有 66375 行、**一个英文词都没有**，
-/// kokoro 有 17 万词的英文表。念不出的时候不是安静跳过，而是被映射成别的音素——
-/// 实测 "API" 和 "GPT" 都念成 "total"，"settings" 念成「操操」。两个不同的词撞成
-/// 同一个音，听感上就是「同一个字被重读了两遍」。
-///
-/// 所以超出能力的词一律删掉：宁可少念一个词，也不要念出不相干的音。
-#[derive(Debug)]
-pub enum Latin {
-    /// 一个都不留（matcha）
-    Drop,
-    /// 只留词典里有的，顺便统一小写——`Settings` 转成 `settings` 才查得到（kokoro）
-    Allow(std::collections::HashSet<String>),
-    /// 全留（melo）
-    ///
-    /// melo 本身就是中英混模型，lexicon 11.2 万条含中英音素；表外的缩写
-    /// （API / JSON / GPU）它也出声——实测是逐字母念出来的，不是吞掉。
-    /// 所以这里不需要白名单，查表反而会误删新词和专有名词。
-    Keep,
-}
-
-impl Latin {
-    fn keep(&self, word: &str) -> Option<String> {
-        let lower = word.to_ascii_lowercase();
-        match self {
-            Latin::Drop => None,
-            Latin::Allow(set) => set.contains(&lower).then_some(lower),
-            Latin::Keep => Some(word.to_string()),
-        }
-    }
-}
-
-/// 读 lexicon 的英文词表。每行是 `词 音素...`，只要第一列。
-///
-/// 读失败时返回空集合，等于「所有英文都删」——宁可少念，也不念错。
-fn load_words(path: &Path) -> std::collections::HashSet<String> {
-    let Ok(body) = std::fs::read_to_string(path) else {
-        crate::log_warn!("读不到英文词表：{}", path.display());
-        return std::collections::HashSet::new();
-    };
-    body.lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .filter(|w| !w.is_empty())
-        .map(|w| w.to_ascii_lowercase())
-        .collect()
-}
-
-#[cfg(test)]
+/// 英文单词**原样保留**：这个模型本身就是中英混的，lexicon 有 11.2 万条含
+/// 中英音素，表外的缩写（API / JSON / GPU）也念得出来——实测是逐字母念的，
+/// 不是吞掉。所以这里不查白名单，查表反而会误删新词和专有名词。
 fn sanitize(text: &str) -> String {
-    sanitize_with(text, &Latin::Drop)
-}
-
-fn sanitize_with(text: &str, latin: &Latin) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_space = false;
     let mut prev: Option<char> = None;
@@ -810,6 +398,28 @@ fn sanitize_with(text: &str, latin: &Latin) -> String {
             continue;
         }
 
+        // 路径/域名整段删掉：`I:/project/agent-ui`、`src/stores` 念出来是
+        // 一串英文单词，对听的人没有任何信息量，还会把句子切得七零八落
+        if raw.is_ascii_alphanumeric() || matches!(raw, '.' | '/' | '\\' | '~') {
+            let mut probe = it.clone();
+            let mut token = String::from(raw);
+            // 冒号也算 token 的一部分：`I:/project`、`https://…` 的斜杠紧跟在
+            // 冒号后面。只是探测用——没有斜杠时不算路径，`3:20` 原样留给后面处理
+            while let Some(&c) = probe.peek() {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '\\' | '-' | '_' | ':') {
+                    token.push(c);
+                    probe.next();
+                } else {
+                    break;
+                }
+            }
+            let slashes = token.matches('/').count() + token.matches('\\').count();
+            if slashes > 0 && token.chars().count() >= 4 {
+                it = probe;
+                continue;
+            }
+        }
+
         // 英文单词：整串取出来再决定留不留，逐个字符判断会把词拆碎
         if raw.is_ascii_alphabetic() {
             let mut word = String::new();
@@ -822,15 +432,13 @@ fn sanitize_with(text: &str, latin: &Latin) -> String {
                     break;
                 }
             }
-            if let Some(kept) = latin.keep(&word) {
-                // 和前面的中文隔开，否则「用settings改」会粘成一个词
-                if !out.is_empty() && !prev_space {
-                    out.push(' ');
-                }
-                prev = kept.chars().last();
-                prev_space = false;
-                out.push_str(&kept);
+            // 和前面的中文隔开，否则「用settings改」会粘成一个词
+            if !out.is_empty() && !prev_space {
+                out.push(' ');
             }
+            prev = word.chars().last();
+            prev_space = false;
+            out.push_str(&word);
             continue;
         }
 
@@ -963,21 +571,34 @@ pub struct Splitter {
     first: bool,
     /// 正在一段 ``` 代码块里。代码块整段不念——见 `push` 里的说明。
     in_fence: bool,
+    /// 正在一行以 `|` 开头的表格行里（流式到达时一行会被拆到多次 delta）
+    in_table_row: bool,
 }
 
 /// 首句允许的最短长度（字）。比这更短的句末标点会被跳过，避免「好的。」单独合成。
 const MIN_FIRST: usize = 6;
-/// 首句没有标点时的软切阈值（在逗号/顿号处切）
-const FIRST_SOFT: usize = 16;
+/// 首句没有标点时的软切阈值（在逗号处切）。首声延迟主要看这个值。
+const FIRST_TARGET: usize = 16;
 /// 首句硬上限。
 ///
-/// 这个值直接决定首声延迟：matcha 的 RTF 是 0.04，22 字约 2.6 秒音频、100ms 合成；
-/// 而用 Kokoro（RTF 0.5）时同样的句子要 1.3 秒，首声会明显变慢。
-const FIRST_HARD: usize = 28;
-/// 后续句的软切阈值
-const SOFT_MAX: usize = 40;
-/// 后续句硬上限
-const HARD_MAX: usize = 70;
+/// 首句短一点是有意的：用户等的是第一声，不是完整的一段。melo 的 RTF 是 0.35，
+/// 16 字约 3 秒音频、1 秒合成。
+const FIRST_HARD: usize = 24;
+
+/// 后续句的目标长度。
+///
+/// **这个值决定听感有没有「分句」**。原来后续句取「最后一个句号，只要总长 ≤70」，
+/// 于是模型吐一段 50 字、含三个句号的回答，会被整段切走、一口气念十几秒——中间
+/// 的逗号全都不停，听起来就是「一段话没有断句」。而句子超过 70 字时又退回取
+/// 「第一个句号」，可能只有两三个字，于是变成「好的。」「对的。」这种碎句，
+/// 播放时一句一顿，就是「卡一下」。
+///
+/// 26 字约 5 秒音频，是「一口气说得完、又听得出层次」的区间。
+const NEXT_TARGET: usize = 26;
+/// 后续句最短长度。比这更短的片段并到下一句里，不单独合成。
+const MIN_NEXT: usize = 8;
+/// 后续句硬上限（整段没有可切标点时兜底）
+const NEXT_HARD: usize = 34;
 
 impl Default for Splitter {
     fn default() -> Self {
@@ -991,20 +612,21 @@ impl Splitter {
             buf: String::new(),
             first: true,
             in_fence: false,
+            in_table_row: false,
         }
     }
 
     /// 喂增量文本，返回所有已经可以合成的句子。
     ///
-    /// 代码块整段丢掉，不只是丢掉「```」这两个符号：块里的
-    /// `for line in buf.split_inclusive` 在 Kokoro 的英文词表里能查到 for/in/line，
-    /// 于是被一本正经念成英文；matcha 则删光英文只剩一串括号，白跑一次合成还
-    /// 留一段静音。两种都不该出声。
+    /// 代码块整段丢掉，不只是丢掉「```」这两个符号：块里的 `for line in buf`
+    /// 会被中英混模型当成英文念出来，纯中文模型则删光英文只剩一串括号，
+    /// 两种都是白跑一次合成、还留一段静音。
     pub fn push(&mut self, delta: &str) -> Vec<String> {
         if delta.is_empty() {
             return Vec::new();
         }
         self.buf.push_str(delta);
+        self.strip_tables();
 
         let mut out = Vec::new();
         // 一次最多切 8 句：防止异常输入（比如模型把整个文档吐进来）把这里卡死
@@ -1024,7 +646,12 @@ impl Splitter {
                 }
                 continue;
             }
-            if self.in_fence || text.is_empty() || !speakable(&text) || is_table_rule(&text) {
+            if self.in_fence
+                || text.is_empty()
+                || !speakable(&text)
+                || is_table_rule(&text)
+                || text.starts_with('|')
+            {
                 continue;
             }
             out.push(text);
@@ -1032,11 +659,41 @@ impl Splitter {
         out
     }
 
+    /// 把表格行整行剔掉。
+    ///
+    /// `| 视图层 | src/components | 侧边栏 |` 念出来是「视图层 src components
+    /// 侧边栏」——没有句子结构，还会把后面的正文切碎。在切分之前删掉，比让
+    /// 切点从行中间穿过去干净（那样会留下「消息流、输入框、设置面板 |」的尾巴）。
+    ///
+    /// 必须在分句前做，所以维护 `in_table_row`：流式到达时一行会跨好几个
+    /// delta，只删当前缓冲里那段会漏掉后面的半个单元格。
+    fn strip_tables(&mut self) {
+        let mut out = String::with_capacity(self.buf.len());
+        for line in self.buf.split_inclusive('\n') {
+            if self.in_table_row {
+                // 上一段 delta 结尾停在半行表格里：这行剩下的部分接着丢
+                if line.ends_with('\n') {
+                    self.in_table_row = false;
+                }
+                continue;
+            }
+            if line.trim_start().starts_with('|') {
+                if !line.ends_with('\n') {
+                    self.in_table_row = true;
+                }
+                continue;
+            }
+            out.push_str(line);
+        }
+        self.buf = out;
+    }
+
     /// 本轮结束：把剩下的半句也交出去
     pub fn flush(&mut self) -> Option<String> {
         let rest = self.buf.trim().to_string();
         self.buf.clear();
         self.first = true;
+        self.in_table_row = false;
         // 代码块没闭合就到结尾了：剩下的同样不念
         let fenced = std::mem::take(&mut self.in_fence);
         if fenced || rest.is_empty() || !speakable(&rest) {
@@ -1051,70 +708,148 @@ impl Splitter {
         self.buf.clear();
         self.first = true;
         self.in_fence = false;
+        self.in_table_row = false;
+    }
+
+    /// 切下 `cut` 之前的文本，剩下的留在缓冲里。
+    ///
+    /// `forced` 表示这是断在字中间的硬切：末尾补个逗号，让合成器知道这里是
+    /// 句内停顿。不补的话最后一个字经常被吞——实测「把现象记」只剩「把现象」。
+    fn take(&mut self, cut: usize, forced: bool) -> String {
+        let mut sentence = self.buf[..cut].to_string();
+        if forced {
+            sentence.push('，');
+        }
+        self.buf = self.buf[cut..].to_string();
+        sentence
     }
 
     fn take_ready(&mut self) -> Option<String> {
+        // 围栏必须单独成段。它只有 4 个字符（"```\n"），按正常规则会被最短长度
+        // 并进后面那段正文——而围栏一翻转状态，跟着它的正文就被当成块内容丢掉了。
+        if self.buf.starts_with("```") {
+            return Some(self.take(3, false));
+        }
+
+
         let chars: Vec<(usize, char)> = self.buf.char_indices().collect();
-        let count = chars.len();
+        // 前一句切走后会留下前导空白（空行、缩进）。不排除的话它们会吃掉长度
+        // 预算：「\n\n主要分三层：」里的冒号会被当成第 8 个字，一句 6 个字的
+        // 短句就被切出来了。
+        let lead = chars
+            .iter()
+            .position(|&(_, c)| !c.is_whitespace())
+            .unwrap_or(chars.len());
+        let count = chars.len().saturating_sub(lead);
         if count == 0 {
             return None;
         }
 
-        let (soft_limit, hard_limit) = if self.first {
-            (FIRST_SOFT, FIRST_HARD)
+        let (min_len, target, hard) = if self.first {
+            (MIN_FIRST, FIRST_TARGET, FIRST_HARD)
         } else {
-            (SOFT_MAX, HARD_MAX)
+            (MIN_NEXT, NEXT_TARGET, NEXT_HARD)
         };
-        let min_len = if self.first { MIN_FIRST } else { 2 };
 
-        let mut first_end: Option<usize> = None;
-        let mut last_end: Option<usize> = None;
-        let mut soft: Option<usize> = None;
+        // 切点不能越过围栏，否则围栏会和正文一起被切成一段，判定成代码块后
+        // 整段（包括正文）都被丢掉
+        let fence_pos = self.buf.find("```");
+        let scan_end = fence_pos.unwrap_or(usize::MAX);
+
+        // 窗口内（≤ target）的最后一个句末标点、第一个句末标点、
+        // 窗口内最后一个逗号，以及「越过 target 后的第一个逗号」
+        let mut win_end: Option<(usize, usize)> = None;
+        let mut first_end: Option<(usize, usize)> = None;
+        let mut win_soft: Option<(usize, usize)> = None;
+        let mut soft_after: Option<(usize, usize)> = None;
 
         for (idx, &(byte, ch)) in chars.iter().enumerate() {
-            let len = idx + 1;
+            if byte >= scan_end {
+                break;
+            }
+            let len = (idx + 1).saturating_sub(lead);
+            if len < min_len {
+                continue;
+            }
+            let cut = byte + ch.len_utf8();
             if is_sentence_end(ch) {
-                if len >= min_len {
-                    if first_end.is_none() {
-                        first_end = Some(byte + ch.len_utf8());
-                    }
-                    last_end = Some(byte + ch.len_utf8());
+                if first_end.is_none() {
+                    first_end = Some((cut, len));
                 }
-            } else if is_soft_break(ch) && len >= min_len && !is_thousands_separator(&chars, idx) {
-                soft = Some(byte + ch.len_utf8());
+                if len <= target {
+                    win_end = Some((cut, len));
+                }
+            } else if is_soft_break(ch) && can_cut_at(&chars, idx) {
+                if len <= target {
+                    win_soft = Some((cut, len));
+                } else if soft_after.is_none() {
+                    soft_after = Some((cut, len));
+                }
             }
         }
 
-        // 首句取第一个句末标点（最快出声），后续句取最后一个（合并得更多、语调更连贯）
-        let cut = if self.first {
-            first_end
-        } else {
-            last_end.or_else(|| if count >= soft_limit { soft } else { None })
+        let hard_cut = || {
+            chars
+                .get(lead + hard.saturating_sub(1))
+                .map(|&(b, c)| b + c.len_utf8())
+                .unwrap_or(usize::MAX)
+                .min(scan_end)
         };
 
-        let forced = cut.is_none();
-        let cut = cut.or_else(|| {
-            if count >= hard_limit {
-                // 没有任何标点可切：按硬上限截断，末端宁可断在字中间也不能无限等
-                Some(
-                    chars
-                        .get(hard_limit - 1)
-                        .map(|&(b, c)| b + c.len_utf8())
-                        .unwrap_or(self.buf.len()),
-                )
-            } else {
-                None
+        if self.first {
+            // 首句：第一个句号就走，最快出声
+            if let Some((cut, len)) = first_end {
+                if len <= hard {
+                    return Some(self.take(cut, false));
+                }
             }
-        })?;
-
-        let mut sentence = self.buf[..cut].to_string();
-        if forced {
-            // 硬切是人为断的：末尾补个逗号，让合成器知道这里是句内停顿。
-            // 不补的话最后一个字经常被吞——实测「把现象记」只剩「把现象」。
-            sentence.push('，');
+            if count >= target {
+                if let Some((cut, _)) = win_soft {
+                    return Some(self.take(cut, false));
+                }
+            }
+            if count >= hard {
+                let cut = hard_cut();
+                return Some(self.take(cut, true));
+            }
+            return None;
         }
-        self.buf = self.buf[cut..].to_string();
-        Some(sentence)
+
+        // 后续句：优先切在窗口内的句号上（一层意思说完）
+        if let Some((cut, _)) = win_end {
+            return Some(self.take(cut, false));
+        }
+        // 句号太远：攒够 target 就退到逗号，别等一整段
+        if count >= target {
+            if let Some((cut, _)) = win_soft {
+                return Some(self.take(cut, false));
+            }
+            // 句号在 target 和 hard 之间：等它，比断在词中间自然
+            if let Some((cut, len)) = first_end {
+                if len <= hard {
+                    return Some(self.take(cut, false));
+                }
+            }
+            // 一个标点都没落在窗口里（句子带长路径或英文词时很常见）：
+            // 退到越过 target 后的第一个逗号，总比硬切在「这是一｜个」中间好
+            if let Some((cut, len)) = soft_after {
+                if len <= hard {
+                    return Some(self.take(cut, false));
+                }
+            }
+        }
+        if count >= hard {
+            let cut = hard_cut();
+            return Some(self.take(cut, true));
+        }
+        // 围栏就在后面，前面的正文又没有任何标点：先把正文整段交出去，
+        // 围栏留到下一次 push 再单独切
+        if let Some(pos) = fence_pos {
+            if pos > 0 {
+                return Some(self.take(pos, true));
+            }
+        }
+        None
     }
 }
 
@@ -1133,12 +868,24 @@ fn is_soft_break(ch: char) -> bool {
 }
 
 /// `1,234` 里那个逗号：两边都是数字，切开会把数字拆成两段
-fn is_thousands_separator(chars: &[(usize, char)], idx: usize) -> bool {
-    if !matches!(chars[idx].1, ',' | '，') {
-        return false;
+fn can_cut_at(chars: &[(usize, char)], idx: usize) -> bool {
+    let ch = chars[idx].1;
+    let prev = idx
+        .checked_sub(1)
+        .and_then(|i| chars.get(i))
+        .map(|&(_, c)| c);
+    let next = chars.get(idx + 1).map(|&(_, c)| c);
+    match ch {
+        // 千分位：`1,234` 从这里断会读成「一 二百三十四」
+        ',' | '，' => {
+            let digit = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit());
+            !(digit(prev) && digit(next))
+        }
+        // 路径和 URL 的冒号：`I:/project`、`https://…` 从这里断，前半句是
+        // 「我看了 I：」、后半句从 `/project` 开始，两边都念不成
+        ':' | '：' => !matches!(next, Some('/') | Some('\\')),
+        _ => true,
     }
-    let digit = |c: Option<&(usize, char)>| c.is_some_and(|&(_, c)| c.is_ascii_digit());
-    digit(idx.checked_sub(1).and_then(|i| chars.get(i))) && digit(chars.get(idx + 1))
 }
 
 #[cfg(test)]
@@ -1160,11 +907,47 @@ mod tests {
     }
 
     #[test]
-    fn later_sentences_merge() {
+    fn short_fragments_merge_into_next() {
         let mut s = Splitter::new();
         assert_eq!(s.push("我们来看第一句。"), vec!["我们来看第一句。"]);
-        // 第二句起合并到最后一个句末标点，一次切出两小句
-        assert_eq!(s.push("好。行。"), vec!["好。行。"]);
+        // 短于 MIN_NEXT 的片段不单独合成——「好。行。」两句各 2 字，
+        // 单独合成就是两次 IPC、两段静音，听感是一顿一顿的
+        assert!(s.push("好。行。").is_empty());
+        assert_eq!(
+            s.push("我知道了，马上处理。"),
+            vec!["好。行。我知道了，马上处理。"]
+        );
+    }
+
+    #[test]
+    fn long_paragraph_is_split_by_target() {
+        let mut s = Splitter::new();
+        // 一段 50 多字、含三个句号的话不能整段念（旧规则会切 50 字，一口气
+        // 念十几秒，中间逗号全不停）。现在每句都不超过 NEXT_TARGET
+        let out = s.push(
+            "这是一个 Tauri 项目，前端代码在 src 目录下。后端逻辑在 src-tauri 里。数据库用 sqlite 存。",
+        );
+        assert!(out.len() >= 2, "应当切出多句，实际：{out:?}");
+        for sentence in &out {
+            assert!(
+                sentence.chars().count() <= NEXT_TARGET + 1,
+                "句子超长（{} 字）：{sentence}",
+                sentence.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn no_tiny_fragments() {
+        let mut s = Splitter::new();
+        let mut out = s.push("好的。我看了一下这个项目，结构挺清楚的，主要分三层。");
+        if let Some(rest) = s.flush() {
+            out.push(rest);
+        }
+        assert!(
+            out.iter().all(|x| x.chars().count() >= MIN_FIRST),
+            "不该出现碎句：{out:?}"
+        );
     }
 
     #[test]
@@ -1218,26 +1001,6 @@ mod tests {
     }
 
     #[test]
-    fn latin_words_follow_lexicon() {
-        // matcha 的 lexicon 一行英文都没有：整词删掉，不留半个残字
-        assert_eq!(sanitize_with("用 API 模型", &Latin::Drop), "用 模型");
-        assert_eq!(sanitize_with("total 和 API", &Latin::Drop), "和");
-
-        // kokoro 只留英文词表里有的，并统一小写（词典是小写的）
-        let set: std::collections::HashSet<String> = ["settings", "base"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let allow = Latin::Allow(set);
-        assert_eq!(
-            sanitize_with("在 Settings 里改 base URL", &allow),
-            "在 settings 里改 base"
-        );
-        // 一个词都不留时，不能留下孤零零的空格
-        assert_eq!(sanitize_with("API GPT", &allow), "");
-    }
-
-    #[test]
     fn speakable_rejects_punctuation_only() {
         assert!(!speakable("……"));
         assert!(!speakable("——！"));
@@ -1257,34 +1020,25 @@ mod tests {
     }
 
     #[test]
-    fn melo_keeps_english_words() {
-        // melo 自己就是中英混模型：表外缩写也念得出来（实测 API/JSON/GPU 都出声），
+    fn english_words_are_kept() {
+        // 这个模型本身就是中英混的：lexicon 11.2 万条含中英音素，表外的缩写
+        // （API / JSON / GPU）也念得出来——实测是逐字母念的，不是吞掉。
         // 所以清洗层不查白名单，原文照留
-        let out = sanitize_with("用 API 调 JSON，再传给 GPU", &Latin::Keep);
+        let out = sanitize("用 API 调 JSON，再传给 GPU");
         assert!(out.contains("API"), "API 被删掉了：{out}");
         assert!(out.contains("JSON"), "JSON 被删掉了：{out}");
         assert!(out.contains("GPU"), "GPU 被删掉了：{out}");
     }
 
     #[test]
-    fn matcha_still_drops_english() {
-        // 对照：matcha 一个英文都不认，留着会念成不相干的音
-        assert_eq!(sanitize("用 API 调 JSON"), "用 调");
-    }
-
-    #[test]
-    fn only_melo_normalizes_volume() {
-        assert_eq!(Kind::Melo.target_peak(), Some(0.85));
-        assert_eq!(Kind::Matcha.target_peak(), None);
-        assert_eq!(Kind::Kokoro.target_peak(), None);
-    }
-
-    #[test]
     fn sanitize_drops_symbol_islands() {
         // 路径、代码、markdown 结构留下的符号串：念出来是「冒号斜杠斜杠」
         assert_eq!(sanitize("我看了 I:/project/agent-ui 的结构"), "我看了 的结构");
-        assert_eq!(sanitize("这是一个 Tauri + Vite + Vue 3 项目"), "这是一个 3 项目");
-        assert_eq!(sanitize("模块 A | 模块 B"), "模块 模块");
+        assert_eq!(
+            sanitize("这是一个 Tauri + Vite + Vue 3 项目"),
+            "这是一个 Tauri Vite Vue 3 项目"
+        );
+        assert_eq!(sanitize("模块 A | 模块 B"), "模块 A 模块 B");
         // 单个句读符号翻成中文标点，停顿不能丢
         assert_eq!(sanitize("步骤 1: 打开设置"), "步骤 1： 打开设置");
         assert_eq!(sanitize("先这样,再那样"), "先这样，再那样");

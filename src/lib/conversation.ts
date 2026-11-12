@@ -31,7 +31,7 @@ import { TTS_NOT_INSTALLED, stopChat, streamChat, ttsSay, ttsStatus, ttsWarmup }
 import type { ChatConfigPayload } from './api'
 import { AudioEngine } from './audio-engine'
 import { STREAM_NOT_INSTALLED, StreamStt } from './stream-stt'
-import type { TtsModel, WireMessage } from './types'
+import type { WireMessage } from './types'
 
 /** 通话的断句阈值，必须和 Rust 侧 `stream_stt::CALL_SILENCE` 保持一致 */
 const CALL_SILENCE = 0.5
@@ -82,10 +82,7 @@ export interface ConversationOptions {
   /** 把本轮用户说的话拼成完整消息列表（含历史） */
   buildMessages: (userText: string) => WireMessage[]
   /** 音色编号 */
-  sid: number
   speed: number
-  /** 用哪个合成模型，和设置里的 `ttsModel` 保持一致 */
-  model: TtsModel
   onState: (state: CallState) => void
   /** 一轮结束（正常说完或被打断），外部据此落库 */
   onTurn: (turn: CallTurn) => void
@@ -97,6 +94,26 @@ export interface ConversationOptions {
 
 const SENTENCE_END = '。！？；!?;…\n'
 const SOFT_BREAK = '，、：,:—'
+
+/** 首句最短长度：太短的不单独合成，等下一句凑够 */
+const MIN_FIRST = 6
+/** 首句软切阈值：没标点时在逗号处切。首声延迟主要看这个值 */
+const FIRST_TARGET = 16
+/** 首句硬上限 */
+const FIRST_HARD = 24
+/**
+ * 后续句目标长度——**这个值决定听感有没有「分句」**。
+ *
+ * 原来是「取最后一个句号，只要总长 ≤70」：模型吐一段 50 字、含三个句号，
+ * 会被整段切走、一口气念十几秒，中间逗号全不停；而超过 70 字时又退回取
+ * 「第一个句号」，可能只有两三个字，于是变成「好的。」这种碎句，播放时一句
+ * 一顿——就是「卡一下」。26 字约 5 秒音频，是听得完、又听得出层次的区间。
+ */
+const NEXT_TARGET = 26
+/** 后续句最短长度：更短的片段并到下一句 */
+const MIN_NEXT = 8
+/** 后续句硬上限（整段没有可切标点时兜底） */
+const NEXT_HARD = 34
 
 /** 有没有能念出来的字。纯标点（「……」「——」）送进合成器只会白跑一趟 */
 const SPEAKABLE = /[\p{L}\p{N}]/u
@@ -113,12 +130,17 @@ function speakable(text: string): boolean {
  */
 function canCutAt(buf: string, i: number): boolean {
   const ch = buf[i]
+  const next = buf[i + 1]
   if (ch === ',' || ch === '，') {
     const prev = buf[i - 1]
-    const next = buf[i + 1]
     if (prev && next && prev >= '0' && prev <= '9' && next >= '0' && next <= '9') {
       return false
     }
+  }
+  // 路径和 URL 的冒号：`I:/project`、`https://…` 从这里断，前半句是
+  // 「我看了 I：」、后半句从 `/project` 开始，两边都念不成
+  if ((ch === ':' || ch === '：') && (next === '/' || next === '\\')) {
+    return false
   }
   return true
 }
@@ -152,8 +174,9 @@ interface Segment {
  *
  * 规则：
  *   - 首句从第一个句末标点切，最短 6 字——用户等的是第一声，不是整段
- *   - 后续句取最后一个句末标点，合并得更多、语调更连贯
- *   - 没有标点时按软阈值（逗号）和硬上限兜底，避免长段无限等
+ *   - 后续句控制在 8-26 字：窗口内的句号优先，太远就退到逗号；
+ *     这样每句都是一层意思，不会一口气念 50 字，也不会碎成一两个字
+ *   - 没有标点时按硬上限兜底，避免长段无限等
  *   - ``` 代码块与表格分隔行整段跳过，不送进合成器
  */
 class Splitter {
@@ -183,16 +206,20 @@ class Splitter {
       // 只补在朗读版本上，会话里那份保持原样。
       const spoken = forced && text ? `${text}，` : text
 
-      // 代码块整段不念：块里的 `for line in buf` 在 Kokoro 的英文词表里查得到
-      // for/in/line，会被一本正经念成英文；matcha 则删光英文只剩括号，白合成一段静音
+      // 代码块整段不念：块里的 `for line in buf` 会被中英混模型当成英文念出来，
+      // 而源码符号删干净后剩下的括号又是一段没有内容的静音
       const fences = text.split('```').length - 1
       if (fences > 0) {
         if (fences % 2 === 1) this.inFence = !this.inFence
         out.push({ raw, speech: null })
         continue
       }
-      // 表格分隔行、纯标点、块内代码同理：会话里留着，但不念
-      const quiet = this.inFence || isTableRule(spoken) || !spoken || !speakable(spoken)
+      // 表格分隔行、纯标点、块内代码同理：会话里留着，但不念。
+      // 表格整行会被切点从中间穿过去，所以按「片段一端带 |」来识别：
+      // 前半段以 | 开头、后半段以 | 结尾，两半都不该念
+      const tablePiece = /^\s*\|/.test(text) || /\|\s*$/.test(text)
+      const quiet =
+        this.inFence || isTableRule(spoken) || tablePiece || !spoken || !speakable(spoken)
       out.push({ raw, speech: quiet ? null : spoken })
     }
     return out
@@ -220,38 +247,65 @@ class Splitter {
     const buf = this.buf
     if (!buf) return -1
 
-    const minLen = this.first ? 6 : 2
-    const softLimit = this.first ? 16 : 40
-    const hardLimit = this.first ? 28 : 70
+    // 围栏必须单独成段：它只有 3 个字符，会被最短长度并进后面那段正文，
+    // 而围栏一翻转状态，跟着它的正文就被当成块内容丢掉了
+    if (buf.startsWith('```')) return 3
 
+    const fence = buf.indexOf('```')
+    const scanEnd = fence >= 0 ? fence : buf.length
+    const [minLen, target, hard] = this.first
+      ? [MIN_FIRST, FIRST_TARGET, FIRST_HARD]
+      : [MIN_NEXT, NEXT_TARGET, NEXT_HARD]
+
+    // 前一句切走后会留下前导空白（空行、缩进）。不排除的话它们会吃掉长度
+    // 预算：「\n\n主要分三层：」里的冒号会被当成第 8 个字，一句 6 个字的
+    // 短句就被切出来了
+    const lead = buf.length - buf.trimStart().length
+    const count = buf.length - lead
+    const lenAt = (i: number) => i + 1 - lead
+
+    let winEnd = -1
     let firstEnd = -1
-    let lastEnd = -1
-    let soft = -1
+    let winSoft = -1
+    /** 越过 target 后的第一个逗号：句子带长路径/英文词时窗口内没有标点可用 */
+    let softAfter = -1
 
-    for (let i = 0; i < buf.length; i += 1) {
+    // 切点不能越过围栏，否则围栏会和正文被切成同一段，判定成代码块后整段丢掉
+    for (let i = 0; i < scanEnd; i += 1) {
       const ch = buf[i]
-      const len = i + 1
+      const len = lenAt(i)
+      if (len < minLen) continue
       if (SENTENCE_END.includes(ch)) {
-        if (len >= minLen) {
-          if (firstEnd < 0) firstEnd = len
-          lastEnd = len
-        }
-      } else if (SOFT_BREAK.includes(ch) && len >= minLen && canCutAt(buf, i)) {
-        soft = len
+        if (firstEnd < 0) firstEnd = len
+        if (len <= target) winEnd = len
+      } else if (SOFT_BREAK.includes(ch) && canCutAt(buf, i)) {
+        if (len <= target) winSoft = len
+        else if (softAfter < 0) softAfter = len
       }
     }
 
-    // 首句要快：第一个句末标点就切
     if (this.first) {
-      if (firstEnd > 0) return firstEnd
-    } else {
-      // 后续句合并到最后一个句末标点，但别把一整篇都攒成一段
-      if (lastEnd > 0 && lastEnd <= hardLimit) return lastEnd
-      if (firstEnd > 0) return firstEnd
+      // 首句：第一个句号就走，最快出声
+      if (firstEnd > 0 && firstEnd <= hard) return firstEnd
+      if (count >= target && winSoft > 0) return winSoft
+      if (count >= hard) return Math.min(lead + hard, scanEnd)
+      return -1
     }
 
-    if (buf.length >= softLimit && soft > 0) return soft
-    if (buf.length >= hardLimit) return hardLimit
+    // 后续句：优先切在窗口内的句号上（一层意思说完）
+    if (winEnd > 0) return winEnd
+    if (count >= target) {
+      // 句号太远：攒够 target 就退到逗号，别等一整段
+      if (winSoft > 0) return winSoft
+      // 句号在 target 和 hard 之间：等它，比断在词中间自然
+      if (firstEnd > 0 && firstEnd <= hard) return firstEnd
+      // 一个标点都没落在窗口里：退到越过 target 后的第一个逗号，
+      // 总比硬切在「这是一｜个」中间好
+      if (softAfter > 0 && softAfter <= hard) return softAfter
+    }
+    if (count >= hard) return Math.min(lead + hard, scanEnd)
+    // 围栏就在后面，前面的正文又没标点：先交出正文，围栏留到下次
+    if (fence > 0) return fence
     return -1
   }
 }
@@ -321,14 +375,14 @@ export class VoiceConversation {
   async start(): Promise<void> {
     if (this.state.phase !== 'idle') return
 
-    const status = await ttsStatus(this.opts.model)
+    const status = await ttsStatus()
     if (!status?.ready) {
       throw new Error(
-        '语音合成模型还没下载：去「设置 → 语音输出」下载 Matcha（约 126MB），下完再打这通电话。',
+        '语音合成模型还没下载：去「设置 → 语音输出」下载 MeloTTS（约 163MB），下完再打这通电话。',
       )
     }
     // 模型已在内存时是毫秒级；没加载则这里等 1-2 秒，好过第一句话卡住
-    await ttsWarmup(this.opts.model).catch(() => {})
+    await ttsWarmup().catch(() => {})
 
     const asr = new StreamStt({
       onPartial: (text) => {
@@ -554,7 +608,7 @@ export class VoiceConversation {
     this.ttsChain = this.ttsChain
       .then(async () => {
         if (turn !== this.turnId) return
-        const speech = await ttsSay(sentence, this.opts.sid, this.opts.speed, this.opts.model)
+        const speech = await ttsSay(sentence, this.opts.speed)
         // 合成期间可能已经被打断
         if (turn !== this.turnId) return
         // 空音频不是「没声音」这种小事：正常句子不该返回 0 采样，
