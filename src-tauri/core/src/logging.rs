@@ -8,7 +8,6 @@
 //!
 //! 除了主日志，各外部服务的原始输出单独成文件（都在同一个目录下）：
 //!
-//! - `stt.log` —— whisper-server 的 stdout/stderr（每次启动覆盖）
 //! - `mcp-<server>.log` —— 每个 MCP server 的 stderr（每次连接覆盖）
 
 use std::fs::{File, OpenOptions};

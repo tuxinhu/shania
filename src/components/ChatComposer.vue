@@ -3,8 +3,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import { fileToAttachment } from '@/lib/image'
 import { fileToTextAttachment, isTextFile } from '@/lib/files'
-import { sttEnsure, sttStatus, transcribeAudio } from '@/lib/api'
-import { PcmSegmenter, pcmToWav } from '@/lib/pcm-recorder'
+import { sttStreamStatus } from '@/lib/api'
+import { PcmSegmenter } from '@/lib/pcm-recorder'
 import { StreamStt } from '@/lib/stream-stt'
 import { closeSegment, closeSession, joinVoice } from '@/lib/punctuate'
 import { useChatStore } from '@/stores/chat'
@@ -126,7 +126,6 @@ function submit() {
   if (stream) {
     void stream.abort()
     stream = null
-    streamMode.value = false
   }
   if (recording.value) {
     recording.value = false
@@ -159,70 +158,28 @@ function toggleTools() {
 /* ------------------------------ 语音输入 ------------------------------ */
 
 const recording = ref(false)
-/** 队列里还有几段没转完，用来显示「识别中」而不是一停止就消失 */
+/** 还有几句没定稿，用来显示「识别中」而不是一停止就消失 */
 const pendingSegments = ref(0)
 /** VAD 判定当前是否在说话，驱动麦克风的呼吸效果 */
 const speaking = ref(false)
-/** 这一次录音走的是 X-ASR 流式（true）还是 whisper 整段（false），决定标题与收尾逻辑 */
-const streamMode = ref(false)
-/**
- * 一次性提示条：引擎兜底、模型缺失这类「不是错误但用户该知道」的事。
- *
- * 兜底是静默进行的会有个副作用——用户改了设置却听不出区别，以为开关坏了。
- * 所以每次发生兜底都在输入框上方说一句，10 秒后自己消失。
- */
-const voiceNotice = ref('')
-let noticeTimer: ReturnType<typeof setTimeout> | null = null
-
-function showVoiceNotice(text: string) {
-  voiceNotice.value = text
-  if (noticeTimer) clearTimeout(noticeTimer)
-  noticeTimer = setTimeout(() => (voiceNotice.value = ''), 10_000)
-}
-
 let segmenter: PcmSegmenter | null = null
-/**
- * 流式识别会话；null 表示这次走 whisper。
- *
- * 两套引擎是互斥的：流式把音频原样喂给模型自己断句，whisper 那条路靠前端能量
- * 切段再整段转写。同时开会重复识别同一段话。
- */
+/** 当前这次录音的识别会话；null 表示没在录音 */
 let stream: StreamStt | null = null
 /**
- * 流式模型装没装。
+ * 模型装没装。
  *
- * 只在「装好了」时长期缓存：用户可能在设置里刚装完就回来点麦克风，
- * 缓存 false 会让他白重启一次。查一次状态只是一次 IPC，失败路径不值得省。
+ * 只在「装好了」时长期缓存：用户可能在设置里刚下完模型就回来点麦克风，
+ * 缓存 false 会让他白重启一次。查一次状态只是一次 IPC。
  */
 let streamReadyCache = false
 
-/** 所有分段串行排队：模型一次只能处理一个请求，并发反而更慢、且会打乱文字顺序 */
-let transcribeQueue: Promise<void> = Promise.resolve()
-/** 会话内缓存解析好的语音服务地址，避免每段都走一次 IPC */
-let cachedSttBaseUrl = ''
-
 const voiceTitle = computed(() => {
-  const who = streamMode.value ? 'X-ASR' : 'whisper'
   if (recording.value) {
-    return speaking.value
-      ? `正在听…${who}（再点结束）`
-      : `聆听中·${who}（说话即可）`
+    return speaking.value ? '正在听…（再点结束）' : '聆听中（说话即可）'
   }
   if (pendingSegments.value > 0) return '正在识别…'
-  return '语音输入（用哪套引擎见「设置 → 语音输入」）'
+  return '语音输入（边说边出字）'
 })
-
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => {
-      const result = String(reader.result ?? '')
-      resolve(result.slice(result.indexOf(',') + 1))
-    }
-    reader.onerror = () => reject(reader.error)
-    reader.readAsDataURL(blob)
-  })
-}
 
 /**
  * 语音输入期间，输入框里「由声音转出来的那段文字」是整体管理的，不是一段段往后追加。
@@ -231,18 +188,13 @@ function blobToBase64(blob: Blob): Promise<string> {
  *   voiceConfirmed 已经定稿的句子
  *   voicePreview   正在说的这一句的临时结果，随时会被下一次识别改写
  *
- * 为什么必须拆开：whisper 没有流式接口，想「边说边出字」只能把当前这段音频
- * 反复整体重解（见 pcm-recorder 的 onPartial）。结果是每次都会吐出一整段文本，
+ * 为什么必须拆开：识别模型每次吐的都是「从头到现在」的整句，不是增量，
  * 直接往后追加的话同一句话会出现三五遍，所以只能「覆盖预览、定稿才追加」。
  */
 let voiceBase = ''
 let voiceConfirmed = ''
 let voicePreview = ''
 
-/** 每定稿一段就 +1：在路上飞着的预览结果如果属于上一段，回来时直接丢掉 */
-let voiceEpoch = 0
-/** 预览请求还没回来：期间不再发新的，免得 CPU 后端排队越积越多 */
-let previewInFlight = false
 /** 麦克风正在打开：这期间重复点击直接忽略，否则 start() 和 stop() 会打架 */
 let voiceStarting = false
 /**
@@ -331,12 +283,12 @@ function endVoiceSession() {
   voiceConfirmed = ''
 }
 
-/** 流式模型装好没有。只在成功时缓存 true——用户中途装完模型，下一次录音就该用上。 */
+/** 模型装好没有。只在成功时缓存 true——用户中途装完模型，下一次录音就该用上。 */
 async function streamReadyNow(): Promise<boolean> {
   if (streamReadyCache) return true
   try {
-    const status = await sttStatus()
-    streamReadyCache = status?.streamReady ?? false
+    const status = await sttStreamStatus()
+    streamReadyCache = status?.ready ?? false
   } catch {
     return false
   }
@@ -344,23 +296,7 @@ async function streamReadyNow(): Promise<boolean> {
 }
 
 /**
- * whisper 这次能不能用。
- *
- * 填了「服务地址」就当作能用——那说明用户把 whisper 指向了别处自己管的服务，
- * 本地装不装都无所谓；没填才去看本地的服务端 exe 与模型。
- */
-async function whisperUsableNow(): Promise<boolean> {
-  if (settingsStore.settings.sttBaseUrl.trim()) return true
-  try {
-    const status = await sttStatus()
-    return !!status?.serverReady && !!status?.modelReady
-  } catch {
-    return false
-  }
-}
-
-/**
- * 打开 X-ASR 识别会话。失败返回 false，调用方据此换 whisper。
+ * 打开识别会话。失败返回 false，调用方据此提示用户。
  *
  * 第一次会加载 134MB 模型（1-2 秒），之后常驻内存，再次 start 是毫秒级。
  */
@@ -384,96 +320,14 @@ async function startStream(): Promise<boolean> {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     if (msg.includes('STREAM_NOT_INSTALLED')) {
-      // 模型没装：安静退回 whisper，不打扰用户
+      // 模型没装：让用户去装，不要静默失败
+      attachError.value = '识别模型还没下载：去「设置 → 语音输入」点「下载模型（约 134MB）」'
       return false
     }
-    // 模型坏了/加载失败：说清楚，但仍然回退，别让语音按钮彻底不可用
-    attachError.value = `流式识别启动失败，已退回兼容模式：${msg}`
+    // 模型坏了/加载失败（文件损坏、缺 DLL）
+    attachError.value = `语音识别启动失败：${msg}（详情见 ~/.shania/logs/）`
     return false
   }
-}
-
-/** 解析语音服务地址：留空走内置本地服务（第一次会顺手把进程拉起来） */
-async function resolveSttBaseUrl(): Promise<string> {
-  if (settingsStore.settings.sttBaseUrl) return settingsStore.settings.sttBaseUrl
-  if (cachedSttBaseUrl) return cachedSttBaseUrl
-  try {
-    const port = await sttEnsure(
-      settingsStore.settings.sttPort || 0,
-      settingsStore.settings.sttBackend,
-    )
-    cachedSttBaseUrl = `http://127.0.0.1:${port}/v1`
-    return cachedSttBaseUrl
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    if (msg.includes('STT_NOT_INSTALLED')) {
-      throw new Error('还没装本地语音服务，去「设置 → 语音输入」点一下安装')
-    }
-    throw err
-  }
-}
-
-async function transcribePcm(pcm: Float32Array): Promise<string> {
-  const baseUrl = await resolveSttBaseUrl()
-  const wav = new Blob([pcmToWav(pcm)], { type: 'audio/wav' })
-  const base64 = await blobToBase64(wav)
-  const text = await transcribeAudio(base64, 'audio/wav', {
-    baseUrl,
-    apiKey: settingsStore.settings.apiKey,
-    model: settingsStore.settings.sttModel || 'whisper-1',
-    language: settingsStore.settings.sttLanguage || undefined,
-  })
-  const clean = text
-    .trim()
-    // whisper 对「说到一半就被切断」的音频会补 `...` / `--` / `…` 表示后面还有，
-    // 那不是用户说的话。只删连续两个以上的点和破折号——单个 `.` 是英文正常句号，
-    // 中文的 `。` 也不在匹配范围里。
-    .replace(/\s*(?:\.{2,}|…+|-{2,}|—+)$/u, '')
-    .trim()
-  // whisper 对纯静音偶尔会吐出「谢谢观看」这类幻觉，短到这个程度直接丢
-  return clean.length < 2 ? '' : clean
-}
-
-/** 一段话结束就排队送去识别；串行执行保证文字按说话顺序落进输入框 */
-function enqueueSegment(pcm: Float32Array) {
-  voiceEpoch += 1
-  pendingSegments.value += 1
-  transcribeQueue = transcribeQueue
-    .then(async () => {
-      const text = await transcribePcm(pcm)
-      // 段长用来决定段末补逗号还是句号，16k 单声道单字节采样数直接换算
-      if (text) commitVoiceSegment(text, (pcm.length / 16000) * 1000)
-    })
-    .catch((err) => {
-      attachError.value = err instanceof Error ? err.message : String(err)
-    })
-    .finally(() => {
-      pendingSegments.value -= 1
-      // 录音已经停了、队列也空了：这一轮语音结束
-      if (!recording.value && pendingSegments.value === 0) endVoiceSession()
-    })
-}
-
-/**
- * 说话过程中的临时结果。**不进串行队列**：它在语义上优先级最低，
- * 一旦被最终结果顶掉就该扔，排进队列只会拖慢定稿。
- */
-function enqueuePreview(pcm: Float32Array) {
-  if (previewInFlight) return
-  previewInFlight = true
-  const epoch = voiceEpoch
-  void transcribePcm(pcm)
-    .then((text) => {
-      // 这段已经定稿（或被下一段顶掉），旧结果不许盖新内容
-      if (epoch !== voiceEpoch || !recording.value) return
-      if (text) previewVoice(text)
-    })
-    .catch(() => {
-      // 预览失败不打扰用户：最终结果还会再来一次
-    })
-    .finally(() => {
-      previewInFlight = false
-    })
 }
 
 async function toggleVoice() {
@@ -485,19 +339,15 @@ async function toggleVoice() {
       voiceCancelled = true
       return
     }
-    // 停止采集；手上剩下的音频会被 flush 成最后一段，识别在后台继续跑
+    // 先停采集（残余帧会同步抛给 onFrame），再收识别会话，最后一句才不会丢
     const currentSeg = segmenter
     segmenter = null
-    // 注意顺序：先停采集（会把残余帧同步抛给 onFrame），再收流式会话
     await currentSeg?.stop()
 
     const currentStream = stream
     stream = null
     if (currentStream) {
-      // 等队列排空 + 冲尾部，最后一句才不会丢
       await currentStream.stop()
-      streamMode.value = false
-      // 流式不经过 whisper 队列，收尾得自己叫
       if (pendingSegments.value === 0) endVoiceSession()
     }
     return
@@ -509,47 +359,23 @@ async function toggleVoice() {
     voiceStarting = true
     voiceCancelled = false
 
-    // 两套引擎地位对等：设置里指定谁就先用谁，指定的那个不可用时换另一个兜底。
-    // 兜底不静默——只说「随意」会把改动藏起来，用户改了设置却听不出区别，
-    // 只会怀疑开关坏了，所以每次兜底都在输入框上方写一句。
-    const engine = settingsStore.settings.sttEngine
-    const streamOk = await streamReadyNow()
-    const whisperOk = await whisperUsableNow()
-
-    let useStream: boolean
-    if (engine === 'stream') useStream = streamOk
-    else if (engine === 'whisper') useStream = !whisperOk && streamOk
-    else useStream = streamOk
-
-    if (!useStream && !whisperOk) {
+    // 模型没装就别开麦克风了——开了也只是录一段没人听的音频
+    if (!(await streamReadyNow())) {
       recording.value = false
-      attachError.value =
-        '没有可用的语音引擎：去「设置 → 语音输入」装 X-ASR 模型（约 134MB）或 whisper（约 190MB）'
+      attachError.value = '识别模型还没下载：去「设置 → 语音输入」点「下载模型（约 134MB）」'
       return
-    }
-    if (engine === 'stream' && !streamOk) {
-      showVoiceNotice('X-ASR 模型还没下载，这次改用 whisper 识别')
-    } else if (engine === 'whisper' && !whisperOk) {
-      showVoiceNotice('whisper 本地服务或模型没装好，这次改用 X-ASR 流式识别')
     }
 
     // 先把界面切到录音态：start() 里要等麦克风设备打开（200-400ms），
     // 那段时间界面一动不动，用户会以为没点上
     recording.value = true
-    // 语音文字直接接在原有内容后面，基准要在任何识别结果回来之前定好
     beginVoiceSession()
 
-    if (useStream) useStream = await startStream()
-    // 模型文件在、但加载失败（文件损坏、缺 DLL）：模型都试过了还失败，只能走 whisper
-    if (!useStream && streamOk && engine !== 'whisper') {
-      showVoiceNotice('X-ASR 启动失败，这次改用 whisper 识别（详情见 ~/.shania/logs/）')
-    }
-    streamMode.value = useStream
+    const started = await startStream()
     // 加载模型这几秒里用户可能已经点了「结束」
-    if (voiceCancelled) {
+    if (voiceCancelled || !started) {
       voiceCancelled = false
       recording.value = false
-      streamMode.value = false
       const pending = stream
       stream = null
       void pending?.abort()
@@ -557,48 +383,25 @@ async function toggleVoice() {
     }
 
     const seg = new PcmSegmenter(
-      useStream
-        ? {
-            // 流式不关心切段结果：句末由模型自己的 endpoint 规则判定，
-            // 这里留空实现，切段逻辑只用来驱动 speaking 的界面状态
-            onSegment: () => {},
-            onFrame: (pcm) => stream?.feed(pcm),
-            onSpeechChange: (value) => {
-              speaking.value = value
-            },
-            onError: (err) => {
-              attachError.value = `录音出错：${err.message}`
-            },
-          }
-        : {
-            onSegment: (pcm) => enqueueSegment(pcm),
-            onPartial: (pcm) => enqueuePreview(pcm),
-            onSpeechChange: (value) => {
-              speaking.value = value
-            },
-            onError: (err) => {
-              attachError.value = `录音出错：${err.message}`
-            },
-          },
       {
-        // 中文口语换气停顿大约 200-300ms，但**不能**贴着这个值切：把阈值压到
-        // 280ms 之后，实测一次输入被切成 53 个碎片（23 个不到 1 秒，29 个被服务端
-        // VAD 判定无语音丢掉），识别质量崩了。420ms 是「能抓住句末」和「别切碎」
-        // 之间的平衡点。
+        // 句末由模型自己的 endpoint 规则判定，这里留空；切段只用来驱动界面状态
+        onSegment: () => {},
+        onFrame: (pcm) => stream?.feed(pcm),
+        onSpeechChange: (value) => {
+          speaking.value = value
+        },
+        onError: (err) => {
+          attachError.value = `录音出错：${err.message}`
+        },
+      },
+      {
+        // 中文口语换气停顿大约 200-300ms，但**不能**贴着这个值切：阈值压得太低
+        // 会把一次输入切成几十个碎片。420ms 是「能抓住句末」和「别切碎」的平衡点。
+        // 注意这只影响界面上的「正在说话」指示，断句由模型负责。
         silenceMs: 420,
-        // 段不够长就继续攒。这是最关键的一条：1 秒的碎片送给模型，没有上下文、
-        // 没有标点，几段拼起来是一坨看不懂的字。
         minCutMs: 1200,
-        // 一口气说很久的兜底。实时性靠 onPartial 保证，这里纯粹是防单段无限增长。
         maxSegmentMs: 6000,
-        // 「好的」这类短语约 400ms，加上 preroll 也要能出字
         minSegmentMs: 250,
-        // 只有 whisper 那条路需要：每 900ms 把整段快照重解一遍做预览。
-        // 流式是模型自己连续解码，再叠一层纯属重复劳动。
-        partialIntervalMs: useStream ? 0 : 900,
-        // 第一版预览等音频够 1.5 秒再发。原来 900ms 就发，服务端日志里
-        // 1.0 秒的请求占了三成多，其中一半被 VAD 判「无语音」白丢掉。
-        minPartialMs: useStream ? 0 : 1500,
       },
     )
     await seg.start()
@@ -606,7 +409,6 @@ async function toggleVoice() {
     if (voiceCancelled) {
       voiceCancelled = false
       recording.value = false
-      streamMode.value = false
       await seg.stop()
       const pending = stream
       stream = null
@@ -617,7 +419,6 @@ async function toggleVoice() {
   } catch (err) {
     voiceCancelled = false
     recording.value = false
-    streamMode.value = false
     // 麦克风打不开时识别器还挂着等音频，主动收掉，别让它白占内存
     const pendingStream = stream
     stream = null
@@ -753,7 +554,6 @@ onUnmounted(() => {
     stream = null
   }
   if (draftTimer) clearTimeout(draftTimer)
-  if (noticeTimer) clearTimeout(noticeTimer)
   document.removeEventListener('click', onDocClick)
 })
 
@@ -769,9 +569,6 @@ defineExpose({ setDraft, focus })
       @dragleave="onDragLeave"
       @drop="onDrop"
     >
-      <p v-if="voiceNotice" class="voice-notice" title="点一下关掉" @click="voiceNotice = ''">
-        {{ voiceNotice }}
-      </p>
       <div v-if="attachments.length || attachError" class="attach-area">
         <div v-for="a in attachments" :key="a.id" class="att" :class="{ doc: a.kind === 'text' }">
           <img v-if="a.kind !== 'text'" :src="a.dataUrl" :alt="a.name" />
@@ -964,19 +761,6 @@ defineExpose({ setDraft, focus })
 .attach-error {
   font-size: 11px;
   color: var(--red);
-}
-
-/* 引擎兜底提示：比错误轻一档，琥珀色，点一下可以关掉 */
-.voice-notice {
-  margin: 0 0 6px;
-  padding: 4px 8px;
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--amber) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--amber) 30%, transparent);
-  font-size: 11px;
-  line-height: 1.4;
-  color: color-mix(in srgb, var(--amber) 72%, var(--text));
-  cursor: pointer;
 }
 
 .drop-hint {

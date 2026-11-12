@@ -81,96 +81,26 @@ export async function saveSettingsRaw(json: string): Promise<void> {
   localStorage.setItem('shania.settings.v1', json)
 }
 
-export interface SttConfigPayload {
-  baseUrl: string
-  apiKey: string
-  model: string
-  language?: string
-}
-
-/**
- * whisper 引擎的整段转写：音频以 base64 传给 Rust，由它转发到 `/audio/transcriptions`。
- *
- * 只走 whisper 那条路（X-ASR 用 `lib/stream-stt.ts` 的 IPC 链路，根本不发 HTTP）。
- * 放在 Rust 侧转发是为了绕开 WebView 的 CORS，同时不把 apiKey 暴露给页面脚本。
- */
-export async function transcribeAudio(
-  audioBase64: string,
-  mime: string,
-  config: SttConfigPayload,
-): Promise<string> {
-  if (!isTauri) throw new Error('浏览器预览环境不支持语音输入')
-  return invoke<string>('transcribe_audio', { audioBase64, mime, config })
-}
-
-/**
- * 两条语音引擎的安装/运行状态。
- *
- * 前半段（serverReady / modelReady / running / port / vadReady …）描述的是
- * **whisper 引擎**：独立子进程 whisper-server，走 HTTP，所以有端口；
- * 后半段（streamReady / streamBytes / streamLoaded）描述 **X-ASR 引擎**：
- * 进程内推理，不占端口，也不需要服务地址。
- */
-export interface SttStatus {
-  serverReady: boolean
-  modelReady: boolean
-  running: boolean
-  port: number
-  modelBytes: number
-  modelTotal: number
-  ffmpegReady: boolean
-  /** 语音活动检测模型：没有它也能跑，只是噪声段更容易编出内容 */
-  vadReady: boolean
-  dir: string
-  /** 设置里选的后端 */
-  backend: 'cpu' | 'cuda'
-  /** 正在跑的进程用的后端，没跑时是空串 */
-  runningBackend: '' | 'cpu' | 'cuda'
-  /** 机器上有没有可用的 NVIDIA 显卡 */
-  gpuAvailable: boolean
-  /** GPU 版二进制是否已装好 */
-  cudaReady: boolean
-  /**
-   * X-ASR 流式模型（约 134MB）装好没有。装好了才可能用流式引擎：
-   * 边说边出字，说完约 1 秒内定稿。
-   */
-  streamReady: boolean
-  /** X-ASR 模型占用多少磁盘 */
-  streamBytes: number
-  /** X-ASR 识别器是否已加载进内存（预加载或第一次录音后为 true） */
-  streamLoaded: boolean
-}
-
 export interface SttProgress {
-  stage: 'server' | 'model' | 'vad' | 'stream' | 'done'
+  stage: 'stream' | 'done'
   done: number
   total: number | null
 }
 
-/** 本地语音服务的安装/运行状态 */
-export async function sttStatus(): Promise<SttStatus | null> {
+/** X-ASR 模型状态：装没装、占多少磁盘、有没有加载进内存 */
+export interface StreamStatus {
+  ready: boolean
+  bytes: number
+  loaded: boolean
+  dir: string
+}
+
+export async function sttStreamStatus(): Promise<StreamStatus | null> {
   if (!isTauri) return null
-  return invoke<SttStatus>('stt_status')
+  return invoke<StreamStatus>('stt_stream_status')
 }
 
-/** 下载服务端与模型（CPU 约 190MB，GPU 约 840MB），进度通过 stt-progress 事件推过来 */
-export async function sttInstall(backend?: 'cpu' | 'cuda'): Promise<void> {
-  if (!isTauri) throw new Error('浏览器预览环境不支持安装语音服务')
-  await invoke('stt_install', { backend })
-}
-
-/** 确保 whisper 本地进程在跑，返回端口；未安装时抛 STT_NOT_INSTALLED（X-ASR 不用这个） */
-export async function sttEnsure(preferredPort = 0, backend?: 'cpu' | 'cuda'): Promise<number> {
-  if (!isTauri) throw new Error('浏览器预览环境不支持本地语音服务')
-  return invoke<number>('stt_ensure', { preferredPort, backend })
-}
-
-export async function sttStop(): Promise<void> {
-  if (!isTauri) return
-  await invoke('stt_stop')
-}
-
-/** 下载 X-ASR 流式模型（约 134MB），进度同样走 stt-progress，stage 为 stream */
+/** 下载 X-ASR 流式模型（约 134MB），进度走 stt-progress，stage 为 stream */
 export async function sttStreamInstall(): Promise<void> {
   if (!isTauri) throw new Error('浏览器预览环境不支持安装语音模型')
   await invoke('stt_stream_install')

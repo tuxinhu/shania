@@ -94,28 +94,8 @@ export interface AppSettings {
   autoStart: boolean
   /** 单次请求的历史预算（按估算 token 计），超出后自动丢弃较早的消息 */
   contextLimit: number
-  /** whisper 引擎的模型名（只有接云端 OpenAI 时才需要填 whisper-1） */
-  sttModel: string
-  /** whisper 引擎的服务地址；留空 = 用程序自己拉起的本地 whisper-server */
-  sttBaseUrl: string
-  /** whisper 本地服务的首选端口，0 表示每次随机（被占时会自动顺延） */
-  sttPort: number
-  /** 程序启动时就把语音引擎拉起来（模型加载慢，按需启动要等几秒）；关掉则退化为用到才起 */
+  /** 程序启动时就把语音模型读进内存（加载要几秒）；关掉则退化为点麦克风时才加载 */
   sttPreload: boolean
-  /**
-   * whisper 引擎的推理后端：`cpu` 兼容性最好；`cuda` 走 NVIDIA 显卡，实测快 3-8 倍。
-   * 选 cuda 但没有可用显卡时，启动会退回 cpu。X-ASR 不用这一项（固定 CPU 推理）。
-   */
-  sttBackend: 'cpu' | 'cuda'
-  /** whisper 引擎的语言提示，留空表示自动判断；X-ASR 是固定的中英双语模型，不受它影响 */
-  sttLanguage: string
-  /**
-   * 用哪个识别引擎。两套引擎地位对等，没有默认优先级：
-   *   auto    装了什么用什么——X-ASR 装了就走它，没装走 whisper
-   *   stream  首选 X-ASR（边说边出字，进程内推理）；它不可用时自动换 whisper 兜底
-   *   whisper 首选 whisper-server（整段转写，需要服务地址+端口）；它不可用时自动换 X-ASR 兜底
-   */
-  sttEngine: 'auto' | 'stream' | 'whisper'
   /** 已保存的模型配置 */
   profiles: ModelProfile[]
   /** 当前生效配置对应的 profile id（手动改过参数则为空） */

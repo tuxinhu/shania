@@ -11,14 +11,11 @@ import {
   openLogsDir,
   setAutoStart,
   setCloseAction,
-  sttEnsure,
-  sttInstall,
-  sttStatus,
-  sttStop,
   sttStreamInstall,
+  sttStreamStatus,
   sttStreamUnload,
   testConnection,
-  type SttStatus,
+  type StreamStatus,
 } from '@/lib/api'
 import { acceleratorFromEvent, formatShortcut } from '@/lib/shortcut'
 import { useChatStore } from '@/stores/chat'
@@ -267,8 +264,8 @@ async function resetAll() {
   }
 }
 
-/* ---------- 本地语音服务 ---------- */
-const stt = ref<SttStatus | null>(null)
+/* ---------- 语音输入（X-ASR） ---------- */
+const stt = ref<StreamStatus | null>(null)
 const sttInstalling = ref(false)
 const sttError = ref('')
 const sttProgress = ref<{ stage: string; done: number; total: number | null }>({
@@ -278,156 +275,51 @@ const sttProgress = ref<{ stage: string; done: number; total: number | null }>({
 })
 let unlistenStt: UnlistenFn | null = null
 
-/** whisper 引擎本地就绪 = 服务端 exe + 模型都在。X-ASR 的模型状态另算（见 streamReady） */
-const whisperReady = computed(() => !!stt.value?.serverReady && !!stt.value?.modelReady)
-
-/**
- * whisper 能不能用（含「填了远程服务地址」的情况）。
- *
- * 引擎判断要用这个而不是 whisperReady：用户完全可以把 whisper 指向别处自己管的
- * 服务，那时本地什么都没装也照样能转写。
- */
-const whisperUsable = computed(
-  () => !!settingsStore.settings.sttBaseUrl.trim() || whisperReady.value,
-)
-
-/** 后端那一行的说明：把「能不能选 / 选了要付什么代价」直接写在脸上（只对 whisper 有效） */
-const backendHint = computed(() => {
-  const info = stt.value
-  if (!info) return '浏览器预览环境不可用'
-  if (!info.gpuAvailable) return '没检测到 NVIDIA 显卡，whisper 只能用 CPU'
-  if (info.backend === 'cuda') {
-    return info.cudaReady
-      ? 'NVIDIA GPU 加速已就绪，whisper 处理 8 秒音频约 0.3 秒出字'
-      : '需要先下载 GPU 版 whisper（约 650MB）'
-  }
-  return info.cudaReady
-    ? '当前用 CPU；GPU 版已装好，切过去即可提速'
-    : '兼容性最好。有 NVIDIA 显卡可切到 GPU，快 3-8 倍（额外约 650MB）'
-})
-
-const whisperStateText = computed(() => {
-  if (!stt.value) return '浏览器预览环境不可用'
-  if (!stt.value.serverReady) {
-    // 填了外部地址时本地装不装都无所谓，这里说「未安装」会让人误以为不能用
-    return settingsStore.settings.sttBaseUrl.trim() ? '走外部地址，未装本地服务' : '未安装'
-  }
-  if (!stt.value.modelReady) {
-    const got = Math.round(stt.value.modelBytes / 1024 / 1024)
-    return got > 0 ? `服务端已装，模型下载未完成（${got}MB）` : '服务端已装，缺模型'
-  }
-  const who = stt.value.runningBackend === 'cuda' ? 'GPU' : 'CPU'
-  const base = stt.value.running
-    ? `就绪（端口 ${stt.value.port}，${who}）`
-    : '已安装，用到时自动启动'
-  // VAD 缺失不影响可用性，但噪声里容易编出内容，值得提一句
-  return stt.value.vadReady ? base : `${base} · 缺降噪模型，重装可补上`
-})
+/** 模型在不在盘上；不在就点麦克风也白搭 */
+const streamReady = computed(() => !!stt.value?.ready)
 
 const sttPercent = computed(() => {
   const { done, total } = sttProgress.value
-  if (!total) return 0
+  if (!total) return done > 0 ? 100 : 0
   return Math.min(100, Math.round((done / total) * 100))
 })
 
 const sttStageText = computed(() => {
   const stage = sttProgress.value.stage
   if (!stage) return ''
-  switch (stage) {
-    case 'server':
-      return '下载 whisper 服务端'
-    case 'model':
-      return '下载 whisper 模型'
-    case 'vad':
-      return '下载语音检测模型'
-    case 'stream':
-      return '下载 X-ASR 模型'
-    case 'done':
-      return '收尾'
-    default:
-      return '下载服务端'
-  }
+  return stage === 'done' ? '收尾' : '下载模型'
 })
 
-/* ---------- X-ASR 流式识别 ---------- */
-
-const streamInstalling = ref(false)
-const streamError = ref('')
-
-/** X-ASR 模型在不在盘上（装好了才可能被选中当主引擎） */
-const streamReady = computed(() => !!stt.value?.streamReady)
-
-/** X-ASR 这一块的状态文字：装没装、装了多少、有没有加载进内存 */
+/** 模型状态：装没装、多大、有没有加载进内存 */
 const streamStateText = computed(() => {
   if (!stt.value) return '浏览器预览环境不可用'
-  if (!stt.value.streamReady) {
-    const mb = Math.round(stt.value.streamBytes / 1024 / 1024)
+  const mb = Math.round(stt.value.bytes / 1024 / 1024)
+  if (!stt.value.ready) {
     return mb > 0 ? `下载未完成（${mb}MB）` : '未安装'
   }
-  return stt.value.streamLoaded ? '已就绪（模型已加载）' : '已安装，用到时自动加载'
+  return stt.value.loaded ? `已就绪（${mb}MB，已加载）` : `已安装（${mb}MB），用到时加载`
 })
 
-/**
- * 引擎三选一的说明。
- *
- * 两套引擎**地位对等**，没有谁是谁的升级版：选谁就先用谁，指定的那个不可用时
- * 自动换另一个兜底。所以这里要说的是「现在实际会走哪个」，而不是暗示流式更高级。
- */
-const engineHint = computed(() => {
-  const engine = settingsStore.settings.sttEngine
-  const stream = streamReady.value
-  const whisper = whisperUsable.value
-  const none = '；两套都没装，点麦克风会提示去安装'
+const preloadHint = computed(() =>
+  settingsStore.settings.sttPreload
+    ? '开：启动后在后台把模型读进内存（约 500MB），点麦克风立刻出字。下次启动生效'
+    : '关：点麦克风时才加载模型，第一次会等 1-2 秒。下次启动生效',
+)
 
-  if (engine === 'whisper') {
-    if (whisper) return '优先 whisper-server：说完一整句才出字，走下面那组的服务地址与端口'
-    if (stream) return '优先 whisper，但本地服务和模型都没装——会改用 X-ASR 流式识别兜底'
-    return `优先 whisper，但本地服务和模型都没装${none}`
-  }
-  if (engine === 'stream') {
-    if (stream) return '优先 X-ASR：边说边出字，说完约 1 秒定稿（进程内推理，不占端口）'
-    if (whisper) return '优先 X-ASR，但它的模型没装——会改用 whisper 兜底'
-    return `优先 X-ASR，但它的模型没装${none}`
-  }
-  if (stream) return '不指定：X-ASR 已就绪就走它（边说边出字）'
-  if (whisper) return '不指定：X-ASR 没装，会走 whisper'
-  return `不指定：两套都没装${none}`
-})
-
-/** 下次录音实际会走哪个引擎——比任何形容词都直观 */
-const engineNextText = computed(() => {
-  const engine = settingsStore.settings.sttEngine
-  const stream = streamReady.value
-  const whisper = whisperUsable.value
-  let now: string
-  if (engine === 'whisper') now = whisper ? 'whisper' : stream ? 'X-ASR（兜底）' : '无可用引擎'
-  else if (engine === 'stream') now = stream ? 'X-ASR' : whisper ? 'whisper（兜底）' : '无可用引擎'
-  else now = stream ? 'X-ASR' : whisper ? 'whisper' : '无可用引擎'
-  return `下次录音会走：${now}`
-})
-
-/** 预加载的说明：只预热当前指定的引擎，避免两套模型同时占内存 */
-const preloadHint = computed(() => {
-  if (!settingsStore.settings.sttPreload) return '关：点麦克风时才加载模型，第一次会等 1-2 秒'
-  if (settingsStore.settings.sttEngine === 'whisper') {
-    return '开：程序启动后拉起 whisper 进程（约 380MB 常驻），点麦克风立刻可用'
-  }
-  if (whisperReady.value && !streamReady.value) {
-    return '开：启动后在后台拉起 whisper 进程（X-ASR 没装，暂时只能用它）'
-  }
-  return '开：启动后把 X-ASR 模型读进内存（约 500MB），点麦克风立刻出字'
-})
+async function refreshStt() {
+  stt.value = await sttStreamStatus().catch(() => null)
+}
 
 async function installStream() {
-  if (streamInstalling.value) return
-  streamInstalling.value = true
-  streamError.value = ''
+  if (sttInstalling.value) return
+  sttInstalling.value = true
+  sttError.value = ''
   try {
     await sttStreamInstall()
   } catch (err) {
-    streamError.value = err instanceof Error ? err.message : String(err)
+    sttError.value = err instanceof Error ? err.message : String(err)
   } finally {
-    streamInstalling.value = false
+    sttInstalling.value = false
     sttProgress.value = { stage: '', done: 0, total: null }
     await refreshStt()
   }
@@ -438,79 +330,13 @@ async function unloadStream() {
   await refreshStt()
 }
 
-async function refreshStt() {
-  stt.value = await sttStatus().catch(() => null)
-}
-
-async function installStt(backend?: 'cpu' | 'cuda') {
-  if (sttInstalling.value) return
-  sttInstalling.value = true
-  sttError.value = ''
-  try {
-    await sttInstall(backend)
-  } catch (err) {
-    sttError.value = err instanceof Error ? err.message : String(err)
-  } finally {
-    sttInstalling.value = false
-    sttProgress.value = { stage: '', done: 0, total: null }
-    await refreshStt()
-  }
-}
-
-/**
- * 切换推理后端。
- *
- * GPU 版是另一个 653MB 的二进制包，第一次选它要先下载——所以这里不只是改个设置项，
- * 而是一个「选了就装、装完就换过去」的动作。
- */
-async function setSttBackend(value: 'cpu' | 'cuda') {
-  if (sttInstalling.value) return
-  const s = settingsStore.settings
-  if (s.sttBackend === value && stt.value?.runningBackend === value) return
-
-  sttError.value = ''
-  if (value === 'cuda' && !stt.value?.cudaReady) {
-    s.sttBackend = 'cuda'
-    await installStt('cuda')
-    if (sttError.value) {
-      // 下载失败就退回 CPU，别把用户留在「选了 GPU 但其实没有」的状态
-      s.sttBackend = 'cpu'
-      return
-    }
-  } else {
-    s.sttBackend = value
-  }
-
-  // 后端变了必须重启进程：现在跑的还是旧的那个可执行文件
-  await sttStop().catch(() => undefined)
-  await refreshStt()
-}
-
-async function stopStt() {
-  await sttStop().catch(() => undefined)
-  await refreshStt()
-}
-
 async function openLogs() {
   // 打不开目录没什么可补救的，记一笔即可；界面上不用弹错
   await openLogsDir().catch((err) => console.error('打开日志目录失败', err))
 }
 
-/** 打开「启动时预加载」时顺便立刻拉起来，不然用户会觉得开关没反应 */
 async function toggleSttPreload() {
-  const next = !settingsStore.settings.sttPreload
-  settingsStore.settings.sttPreload = next
-  if (!next) return
-  // 能立刻生效的只有 whisper 进程：X-ASR 没有「现在就读盘」的命令，它在下一次
-  // 点麦克风（或下次启动）时加载。所以引擎指向 X-ASR 时这里什么都不用做。
-  const engine = settingsStore.settings.sttEngine
-  if (engine === 'stream') return
-  if (engine === 'auto' && streamReady.value) return
-  if (!whisperReady.value) return
-  await sttEnsure(settingsStore.settings.sttPort || 0).catch((err) => {
-    sttError.value = err instanceof Error ? err.message : String(err)
-  })
-  await refreshStt()
+  settingsStore.settings.sttPreload = !settingsStore.settings.sttPreload
 }
 
 onMounted(async () => {
@@ -708,44 +534,43 @@ onUnmounted(() => {
             <!-- 语音输入 -->
             <section>
               <div class="section-title">语音输入</div>
-
-              <!-- 引擎：指定用哪个，另一个自动兜底 -->
               <div class="group">
                 <div class="field">
                   <div class="stt-head">
-                    <span>识别引擎</span>
-                    <span class="stt-state">{{ engineNextText }}</span>
+                    <span>识别模型</span>
+                    <span class="stt-state" :class="{ ok: streamReady, warn: !!stt && !streamReady }">
+                      {{ streamStateText }}
+                    </span>
                   </div>
-                  <div class="seg-group">
+                  <div class="stt-actions">
                     <button
-                      class="seg"
-                      :class="{ on: settingsStore.settings.sttEngine === 'auto' }"
-                      title="装了什么用什么：X-ASR 装了就走它，没装走 whisper"
-                      @click="settingsStore.settings.sttEngine = 'auto'"
+                      v-if="!streamReady"
+                      class="mini-btn primary"
+                      :disabled="sttInstalling"
+                      @click="installStream"
                     >
-                      自动
+                      {{ sttInstalling ? '下载中…' : '下载模型（约 134MB）' }}
                     </button>
                     <button
-                      class="seg"
-                      :class="{ on: settingsStore.settings.sttEngine === 'stream' }"
-                      :disabled="!streamReady"
-                      :title="
-                        streamReady ? '优先用 X-ASR（边说边出字）' : '先下载 X-ASR 模型才能选'
-                      "
-                      @click="settingsStore.settings.sttEngine = 'stream'"
+                      v-else-if="stt?.loaded"
+                      class="mini-btn"
+                      title="释放内存，下次录音时再重新加载"
+                      @click="unloadStream"
                     >
-                      X-ASR
+                      卸载模型
                     </button>
-                    <button
-                      class="seg"
-                      :class="{ on: settingsStore.settings.sttEngine === 'whisper' }"
-                      title="优先用 whisper-server（整段转写，需要服务地址与端口）"
-                      @click="settingsStore.settings.sttEngine = 'whisper'"
-                    >
-                      whisper
-                    </button>
+                    <span v-if="stt?.dir" class="stt-dir" :title="stt.dir">~/.shania/models/…</span>
                   </div>
-                  <p class="help">{{ engineHint }}</p>
+                  <div v-if="sttInstalling" class="stt-progress">
+                    <div class="stt-bar"><i :style="{ width: `${sttPercent}%` }" /></div>
+                    <span>{{ sttStageText }} {{ sttPercent }}%</span>
+                  </div>
+                  <p v-if="sttError" class="stt-error">{{ sttError }}</p>
+                  <p class="help">
+                    用 <code>X-ASR 160ms</code>（中英双语，模型自带标点，int8 量化 134MB）。
+                    识别在<strong>本进程内</strong>完成：<strong>不监听端口、不需要服务地址、没有独立进程要管</strong>。
+                    说话时字跟着往外冒，首字约 0.4 秒，停 1 秒左右自动定稿。
+                  </p>
                 </div>
                 <div class="field last">
                   <div class="stt-preload">
@@ -763,183 +588,6 @@ onUnmounted(() => {
                       <span class="knob" />
                     </button>
                   </div>
-                </div>
-              </div>
-
-              <!-- X-ASR：进程内推理，不占端口 -->
-              <div class="group">
-                <div class="field last">
-                  <div class="stt-head">
-                    <span>X-ASR 流式模型</span>
-                    <span class="stt-state" :class="{ ok: streamReady, warn: !!stt && !streamReady }">
-                      {{ streamStateText }}
-                    </span>
-                  </div>
-                  <div class="stt-actions">
-                    <button
-                      v-if="!streamReady"
-                      class="mini-btn primary"
-                      :disabled="streamInstalling"
-                      @click="installStream"
-                    >
-                      {{ streamInstalling ? '下载中…' : '下载模型（约 134MB）' }}
-                    </button>
-                    <button
-                      v-else-if="stt?.streamLoaded"
-                      class="mini-btn"
-                      title="释放内存，下次录音时再重新加载"
-                      @click="unloadStream"
-                    >
-                      卸载模型
-                    </button>
-                    <span class="stt-dir" title="~/.shania/models/stream-x-asr-160ms-zh-en-punct-int8/">
-                      ~/.shania/models/stream-x-asr-160ms-…
-                    </span>
-                  </div>
-                  <div v-if="streamInstalling" class="stt-progress">
-                    <div class="stt-bar"><i :style="{ width: `${sttPercent}%` }" /></div>
-                    <span>{{ sttStageText }} {{ sttPercent }}%</span>
-                  </div>
-                  <p v-if="streamError" class="stt-error">{{ streamError }}</p>
-                  <p class="help">
-                    <code>X-ASR 160ms</code>（中英双语，模型自带标点，int8 量化 134MB）。
-                    识别在<strong>本进程内</strong>完成，<strong>不监听端口、不需要服务地址</strong>——
-                    下面「whisper 本地服务」里的端口和地址对它无效。
-                    说话时字跟着往外冒，首字约 0.4 秒，停 1 秒左右自动定稿。
-                  </p>
-                </div>
-              </div>
-              <!-- whisper：独立进程 + HTTP，下面这组的端口/地址只对它有效 -->
-              <div class="group">
-                <div class="field">
-                  <div class="stt-head">
-                    <span>whisper 本地服务</span>
-                    <span class="stt-state" :class="{ ok: whisperReady, warn: !!stt && !whisperReady }">
-                      {{ whisperStateText }}
-                    </span>
-                  </div>
-                  <div class="stt-switch-row">
-                    <div class="row-text">
-                      <span class="row-label">推理后端</span>
-                      <span class="row-sub">{{ backendHint }}</span>
-                    </div>
-                    <div class="seg-group">
-                      <button
-                        class="seg"
-                        :class="{ on: stt?.backend === 'cpu' }"
-                        :disabled="sttInstalling"
-                        @click="setSttBackend('cpu')"
-                      >
-                        CPU
-                      </button>
-                      <button
-                        class="seg"
-                        :class="{ on: stt?.backend === 'cuda' }"
-                        :disabled="sttInstalling || !stt?.gpuAvailable"
-                        :title="stt?.gpuAvailable ? '用 NVIDIA 显卡推理' : '没有检测到可用的 NVIDIA 显卡'"
-                        @click="setSttBackend('cuda')"
-                      >
-                        GPU
-                      </button>
-                    </div>
-                  </div>
-                  <div class="stt-actions">
-                    <button
-                      v-if="!whisperReady"
-                      class="mini-btn primary"
-                      :disabled="sttInstalling"
-                      @click="installStt()"
-                    >
-                      {{
-                        sttInstalling
-                          ? '安装中…'
-                          : stt?.backend === 'cuda'
-                            ? '下载 GPU 版（约 650MB）'
-                            : '一键安装（约 190MB）'
-                      }}
-                    </button>
-                    <button
-                      v-else-if="stt?.running"
-                      class="mini-btn"
-                      title="进程会在下次转写时重新拉起"
-                      @click="stopStt"
-                    >
-                      停止服务
-                    </button>
-                    <span v-if="stt?.dir" class="stt-dir" :title="stt.dir">{{ stt.dir }}</span>
-                  </div>
-                  <div v-if="sttInstalling" class="stt-progress">
-                    <div class="stt-bar"><i :style="{ width: `${sttPercent}%` }" /></div>
-                    <span>{{ sttStageText }} {{ sttPercent }}%</span>
-                  </div>
-                  <p v-if="sttError" class="stt-error">{{ sttError }}</p>
-                  <p class="help">
-                    独立子进程 <code>whisper-server</code>，模型 small-q5_1，装到
-                    <code>~/.shania/</code>。它靠 HTTP 收音频，<strong>所以下面四个字段都只对它有效；X-ASR 完全用不到</strong>。
-                    进程用到才起、常驻复用，退出应用时杀掉；点「停止服务」可以立即释放内存（约 380MB）。
-                    手机热点或网络慢的话，下载可能要好几分钟。
-                  </p>
-                </div>
-                <div class="field">
-                  <label for="sttPort">服务端口</label>
-                  <input
-                    id="sttPort"
-                    v-model.number="settingsStore.settings.sttPort"
-                    type="number"
-                    min="0"
-                    max="65535"
-                    placeholder="28080"
-                  />
-                  <p class="help">
-                    whisper 进程的监听端口，默认 <code>28080</code>，和 <code>pnpm stt</code> 启动的脚本一致，
-                    方便直接 curl 调试（没用 8080 是因为它常被其他开发工具占）。被占用时会自动往后顺延，
-                    不会启动失败；填 <code>0</code> 表示每次都让系统随机分配。改完下次转写生效
-                    （正在跑的进程不受影响）。
-                  </p>
-                </div>
-                <div class="field">
-                  <label for="sttBaseUrl">识别服务地址</label>
-                  <input
-                    id="sttBaseUrl"
-                    v-model.trim="settingsStore.settings.sttBaseUrl"
-                    type="text"
-                    spellcheck="false"
-                    placeholder="http://127.0.0.1:28080/v1"
-                  />
-                  <p class="help">
-                    <strong>留空 = 用上面这套内置 whisper 服务</strong>，不必手动起进程。
-                    只有想接远程或自己管的 whisper 服务时才填，要填到 <code>/v1</code> 为止，
-                    程序会自己补 <code>/audio/transcriptions</code>。填了之后就不再检查本地是否安装。
-                  </p>
-                </div>
-                <div class="field">
-                  <label for="sttModel">识别模型</label>
-                  <input
-                    id="sttModel"
-                    v-model.trim="settingsStore.settings.sttModel"
-                    type="text"
-                    spellcheck="false"
-                    placeholder="whisper-1"
-                  />
-                  <p class="help">
-                    只对 whisper 生效。复用上面的 API Key；本地 whisper-server 忽略这个字段
-                    （模型在启动参数里定），填什么都行；接云端 OpenAI 才需要填 <code>whisper-1</code>。
-                    X-ASR 的模型是固定的，没有这一项。
-                  </p>
-                </div>
-                <div class="field last">
-                  <label for="sttLanguage">语言提示</label>
-                  <input
-                    id="sttLanguage"
-                    v-model.trim="settingsStore.settings.sttLanguage"
-                    type="text"
-                    spellcheck="false"
-                    placeholder="zh"
-                  />
-                  <p class="help">
-                    只对 whisper 生效：留空由服务端自动判断，填 <code>zh</code> / <code>en</code>
-                    能减少短句误识别。X-ASR 是中英双语模型，语言由模型自己判，不看这一项。
-                  </p>
                 </div>
               </div>
             </section>

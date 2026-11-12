@@ -24,32 +24,32 @@ const DEFAULTS: AppSettings = {
   closeAction: 'tray',
   autoStart: false,
   contextLimit: 32000,
-  sttModel: 'whisper-1',
-  // whisper 引擎专用：留空 = 用程序自己拉起的本地 whisper-server；接远程服务时才填
-  sttBaseUrl: '',
-  sttPort: 28080,
   sttPreload: true,
-  // 默认 CPU：不需要任何额外下载（8.6MB）就能用；有 NVIDIA 显卡的用户
-  // 可以在设置里换成 cuda（额外 650MB，快好几倍）
-  sttBackend: 'cpu' as 'cpu' | 'cuda',
-  sttLanguage: 'zh',
-  // auto：X-ASR 装了就走它，没装走 whisper——用户不用理解两套引擎的区别。
-  // 手动指定某一套时，它不可用会自动换另一套兜底。
-  sttEngine: 'auto' as 'auto' | 'stream' | 'whisper',
   profiles: [],
   activeProfileId: '',
 }
+
+/**
+ * 已经废弃的设置项：whisper 引擎的端口/地址/后端/语言，以及引擎选择本身。
+ *
+ * 语音输入统一走 X-ASR 之后这些都没有意义了。解析时直接丢掉，否则它们会随着
+ * 「整对象写回」一直留在 `settings.json` 里——用户打开文件看到一堆不起作用的
+ * 字段，只会以为程序还在用它。
+ */
+const OBSOLETE_KEYS = ['sttModel', 'sttBaseUrl', 'sttPort', 'sttBackend', 'sttLanguage', 'sttEngine']
 
 function parse(raw: string | null): AppSettings {
   if (!raw) return { ...DEFAULTS, profiles: [] }
   try {
     const parsed = JSON.parse(raw) as Partial<AppSettings>
-    return {
+    const merged: AppSettings = {
       ...DEFAULTS,
       ...parsed,
       // 数组字段必须是新引用，避免多个 store 实例共享同一份默认值
       profiles: Array.isArray(parsed.profiles) ? parsed.profiles : [],
     }
+    for (const key of OBSOLETE_KEYS) delete (merged as unknown as Record<string, unknown>)[key]
+    return merged
   } catch {
     return { ...DEFAULTS, profiles: [] }
   }

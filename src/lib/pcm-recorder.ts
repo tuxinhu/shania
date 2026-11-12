@@ -1,23 +1,15 @@
 /**
- * 实时录音 + 静音切句。
+ * 实时录音：采集 + 能量切句 + 100ms 定长出帧。
  *
- * 原来的做法是 MediaRecorder 录完整个 webm 再一次性转写，用户得等「停止录音」之后
- * 几秒才看到字。这里改成：直接拿原始 PCM，边录边用能量判断「这句话说完了」，
- * 一句话结束就把这一小段送去转写——用户还在说第二句时，第一句的字已经出现了。
+ * AudioWorklet 直接拿原始 float32 帧，重采样到 16k，然后分两路：
  *
- * 三个必须自己做的事（whisper-server 不提供流式接口）：
- *   1. 采集：AudioWorklet 拿 float32 帧，重采样到 16k 交给 VAD
- *   2. 切句：RMS 低于自适应阈值且持续 `silenceMs` 就认为一句结束
- *   3. 编码：每段直接写 WAV（16k/16bit/单声道），不经过 webm/ffmpeg
+ *   1. `onFrame`：每 100ms 抛一块**连续的**原始 PCM 给流式识别（`lib/stream-stt.ts`）。
+ *      这条路上不做任何切分——断句由模型自己的 endpoint 规则判定，前端切碎了反而丢上下文。
+ *   2. `onSegment` + `onSpeechChange`：只用来驱动界面（麦克风的呼吸效果、说话状态）。
  *
- * 切句参数是「延迟 vs 完整度」的权衡：静音判定越长越不容易把一个词切成两半，
- * 但字幕出现得越晚。500ms 是中文口语比较稳的值。
- *
- * 想做到「边说边出字」，光靠缩短 `silenceMs` 不够——一口气说 10 秒没有停顿，
- * 就得等 10 秒才有字。所以另有 `onPartial`：说话过程中每隔 `partialIntervalMs`
- * 把「当前这段到目前为止的音频」整体快照出去，调用方送去做一次临时转写，
- * 结果直接覆盖显示。等真正切段时再给一次最终结果。等于滑动窗口重新解码，
- * 代价是同一段音频会算几遍（CUDA 上 3 秒音频只要 120ms，完全算得过来）。
+ * 早期这里还负责「按静音切句 → 每段整体送去 whisper 转写」，另有一套
+ * `onPartial` 快照机制做边说边出字的假流式。换成 X-ASR 之后那套全删了：
+ * 模型自己会连着解码，不需要前端反复重解同一段音频。
  */
 
 const TARGET_RATE = 16000
@@ -50,23 +42,11 @@ export interface SegmentOptions {
   minSegmentMs?: number
   /** 检测到语音后，向前补一点，避免吞掉首字 */
   prerollMs?: number
-  /** 说话过程中多久吐一次临时快照（0 = 关闭实时预览） */
-  partialIntervalMs?: number
-  /**
-   * 快照至少要有这么长的音频才发。实测 1.2 秒以下的片段 whisper 一个标点都不给，
-   * 服务端 VAD 也经常判「无语音」直接丢弃——白发一趟请求，白占一次推理。
-   */
-  minPartialMs?: number
 }
 
 export interface SegmenterCallbacks {
   /** 一段话结束（或硬切），拿到的已经是 16k 单声道 PCM */
   onSegment: (pcm: Float32Array, durationMs: number) => void
-  /**
-   * 当前这一段的临时快照：从段首到此刻，**不会**重置分段状态。
-   * 用来边说话边显示结果，内容随时会被下一次快照改写。
-   */
-  onPartial?: (pcm: Float32Array, durationMs: number) => void
   /**
    * 连续的原始音频流，每约 100ms 一块，**不做任何切分**。
    *
@@ -86,8 +66,6 @@ const DEFAULTS: Required<SegmentOptions> = {
   maxSegmentMs: 8000,
   minSegmentMs: 320,
   prerollMs: 200,
-  partialIntervalMs: 0,
-  minPartialMs: 0,
 }
 
 /** AudioWorklet 只负责把麦克风数据递出来，判断逻辑全在主线程，改参数不用重建节点 */
@@ -130,7 +108,6 @@ export class PcmSegmenter {
   private calibrated = 0
   private running = false
   /** 当前段上次抛临时快照时的长度（毫秒），控制快照频率 */
-  private partialAt = 0
   /** 流式出帧的累积缓冲（只在接了 onFrame 时使用） */
   private outBuf: Float32Array[] = []
   private outLen = 0
@@ -196,7 +173,6 @@ export class PcmSegmenter {
     this.source = ctx.createMediaStreamSource(stream)
     this.source.connect(this.node)
     // 不接 destination：接了会把麦克风回放出来，形成啸叫
-    this.partialAt = 0
     this.outBuf = []
     this.outLen = 0
     this.running = true
@@ -300,9 +276,8 @@ export class PcmSegmenter {
       this.segment.push(chunk)
       this.segmentLen += chunk.length
       this.silenceRun = 0
-      this.emitPartial()
     } else if (this.speaking) {
-      // 静音也要收进本段，尾部留一点静音对 whisper 更友好
+      // 静音也要收进本段：尾部留一点静音，切出来的段更完整
       this.segment.push(chunk)
       this.segmentLen += chunk.length
       this.silenceRun += ms
@@ -323,31 +298,10 @@ export class PcmSegmenter {
       while (this.preRoll.length > keep) this.preRoll.shift()
     }
 
-    // 一口气说太久（没停顿）就硬切，否则服务端的 audio_ctx 会吃不下
+    // 一口气说太久（没停顿）就硬切：界面的「正在说话」状态不能无限挂着
     if (this.speaking && this.segmentLen / TARGET_RATE * 1000 >= this.opts.maxSegmentMs) {
       this.cut()
     }
-  }
-
-  /**
-   * 说话过程中每隔 `partialIntervalMs` 抛一次当前段的快照。
-   *
-   * 快照是「从段首到此刻」的**完整**音频，不是增量——whisper 没有上下文记忆，
-   * 只给后半截会丢词、标点和用词都会飘。整段重解码才能保证显示的字一直稳定。
-   * 代价是同一段要算好几遍，所以频率不能太高；调用方还会做「上一次没算完就跳过」。
-   */
-  private emitPartial() {
-    const interval = this.opts.partialIntervalMs
-    if (!this.cbs.onPartial || interval <= 0) return
-    const elapsed = (this.segmentLen / TARGET_RATE) * 1000
-    // 太短就别发：第一次快照原本落在 900ms，那会儿音频既不够识别（无标点、
-    // 容易错字），服务端 VAD 还有一半概率直接判「无语音」丢掉
-    if (elapsed < this.opts.minPartialMs) return
-    if (elapsed - this.partialAt < interval) return
-    // 离硬切只差一点点了，等最终结果更准，别白算一遍
-    if (elapsed >= this.opts.maxSegmentMs - interval / 2) return
-    this.partialAt = elapsed
-    this.cbs.onPartial(concat(this.segment, this.segmentLen), elapsed)
   }
 
   /** 结束当前段并发出去 */
@@ -357,15 +311,13 @@ export class PcmSegmenter {
     this.segment = []
     this.segmentLen = 0
     this.silenceRun = 0
-    this.partialAt = 0
     this.speaking = false
     this.cbs.onSpeechChange?.(false)
 
     if (durationMs < this.opts.minSegmentMs) return
     // 整段平均能量太低，说明这次是被键盘、咳嗽、风扇之类的噪声误触发的。
-    // 这种段送进去 whisper 最爱编东西——「(字幕:xxx)」「谢谢观看」「你不要再说了」
-    // 都是这么来的，不如根本不解。0.02 是留给轻声说话的余量：人说话再怎么轻
-    // 平均 RMS 也在 0.03 以上，而空调/风扇的底噪撑不到 0.02。
+    // 这种段是键盘、咳嗽、风扇误触发的，不该当成一句话。0.02 是留给轻声说话的
+    // 余量：人说话再怎么轻平均 RMS 也在 0.03 以上，而空调/风扇的底噪撑不到 0.02。
     if (rootMeanSquare(pcm) < Math.max(this.threshold(), 0.02)) return
     this.cbs.onSegment(pcm, durationMs)
   }
@@ -376,8 +328,7 @@ export class PcmSegmenter {
   }
 
   /**
-   * 累积到 `FRAME_CHUNK` 就抛一块出去。没接 `onFrame` 时什么都不做，
-   * 走 whisper 那条路时不会有任何额外开销。
+   * 累积到 `FRAME_CHUNK` 就抛一块出去。没接 `onFrame` 时什么都不做，没有额外开销。
    */
   private emitFrame(frame: Float32Array) {
     if (!this.cbs.onFrame) return
@@ -426,36 +377,4 @@ function concat(parts: Float32Array[], total: number): Float32Array {
     offset += part.length
   }
   return out
-}
-
-/** 16k / 16bit / 单声道 WAV；whisper-server 收到 wav 就不需要 ffmpeg 了 */
-export function pcmToWav(pcm: Float32Array): ArrayBuffer {
-  const dataBytes = pcm.length * 2
-  const view = new DataView(new ArrayBuffer(44 + dataBytes))
-
-  writeAscii(view, 0, 'RIFF')
-  view.setUint32(4, 36 + dataBytes, true)
-  writeAscii(view, 8, 'WAVE')
-  writeAscii(view, 12, 'fmt ')
-  view.setUint32(16, 16, true)
-  view.setUint16(20, 1, true)
-  view.setUint16(22, 1, true)
-  view.setUint32(24, TARGET_RATE, true)
-  view.setUint32(28, TARGET_RATE * 2, true)
-  view.setUint16(32, 2, true)
-  view.setUint16(34, 16, true)
-  writeAscii(view, 36, 'data')
-  view.setUint32(40, dataBytes, true)
-
-  let offset = 44
-  for (let i = 0; i < pcm.length; i += 1) {
-    const s = Math.max(-1, Math.min(1, pcm[i]))
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true)
-    offset += 2
-  }
-  return view.buffer
-}
-
-function writeAscii(view: DataView, offset: number, text: string) {
-  for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i))
 }

@@ -24,8 +24,6 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 base64 = "0.22"
 futures-util = "0.3"
-# 解压 whisper 预编译包用；只保留解压需要的 deflate
-zip = { version = "2", default-features = false, features = ["deflate"] }
 # 流式模型是 .tar.bz2（134MB），这两块只在 stream-stt 下编译
 tar = { version = "0.4", optional = true }
 bzip2 = { version = "0.4", optional = true }

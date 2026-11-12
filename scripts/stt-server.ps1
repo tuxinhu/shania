@@ -11,7 +11,8 @@
 #       ~/.shania/tools/whisper-cuda/Release/whisper-server.exe       （GPU 版）
 #       ~/.shania/models/ggml-small-q5_1.bin
 #
-# 桌面端会在设置里自动装到同样的目录，这个脚本只是方便命令行调试。
+# 注意：桌面端已经不再内置 whisper（语音输入统一走进程内的 X-ASR），
+# 这里保留脚本和模型只是方便独立调试 / 将来接回来。程序不会调用它。
 
 param(
     [int]$Port = 28080,
@@ -33,7 +34,7 @@ if (-not $Model) {
 }
 
 if (-not (Test-Path $serverExe)) {
-    Write-Error "找不到 whisper-server：$serverExe（$Backend 版没装？桌面端设置 → 语音输入里可以切）"
+    Write-Error "找不到 whisper-server：$serverExe（$Backend 版没装？）"
     exit 1
 }
 if (-not (Test-Path $Model)) {

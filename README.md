@@ -52,7 +52,7 @@ WebView2 与托盘。拆开后 CLI 二进制只含 reqwest + serde，Agent 逻�
 - 流式对话 + Markdown 渲染 + 代码高亮
 - 图片上传（>1.2MB 自动重编码，长边 1568，PNG 保透明），支持视觉模型
 - **文本附件**：md / json / csv / 代码等文本文件读成正文注入上下文（单文件 ≤512KB、注入 ≤20 万字，超出截断并注明）；二进制文件明确拒绝，不假装能理解
-- **语音输入**：两套引擎可指定、互为兜底——X-ASR（进程内、边说边出字）与 whisper-server（HTTP、整段转写），文字实时填入光标处（见下方「语音与 MCP」）
+- **语音输入**：X-ASR 流式识别（进程内推理、边说边出字、不占端口），文字实时填入光标处（见下方「语音与 MCP」）
 - 失败重试、编辑重发、删除消息
 - 上下文自动裁剪（token 估算：中文 1.05 token/字，图片 1200 token，超限时首部插「已省略 N 条」）
 - Agent 工具调用：Rust 侧多轮循环，前端显示工具卡片 + 结果折叠
@@ -74,7 +74,7 @@ WebView2 与托盘。拆开后 CLI 二进制只含 reqwest + serde，Agent 逻�
 ### 设置与交付
 - 多模型配置 profiles：baseURL / apiKey / 模型名，一键切换 + 连接测试
 - **深色主题**：浅色 / 深色 / 跟随系统，首屏前由内联脚本定主题（不闪白）
-- 语音识别配置：引擎三选一（自动 / X-ASR / whisper）+ 启动预加载；端口与地址只对 whisper 生效
+- 语音识别配置：模型状态 + 启动预加载（不需要端口、地址、语言这些参数）
 - 会话导出 Markdown / JSON
 - 自动更新骨架（updater 插件已接入，见"未完成"）
 
@@ -99,49 +99,46 @@ pnpm install        # 首次（或换机后）
 pnpm mock           # 起 mock LLM 服务（127.0.0.1:4000，协议为 OpenAI 兼容；PORT=xxxx 可改端口）
 pnpm dev            # 起 Vite 开发服务器（1420 端口）
 pnpm app:dev        # Tauri 开发模式（自动带起 pnpm dev，等价一条命令）
-pnpm stt            # 起本地语音识别服务（127.0.0.1:28080，见下节）
+pnpm stt            # 起旧的 whisper-server（桌面端已不再调用，仅手动调试用）
 ```
 
 ### 语音与 MCP
 
-**语音输入**：桌面端自带本地语音的**安装 + 启动**，不需要用户自己编译或起进程。
+**语音输入**：桌面端自带模型的**下载 + 加载**，不需要装任何服务、起任何进程。
 **边说边转**——不用等点「结束」，说的时候字就跟着往外冒。
 
-两套引擎，**地位对等、没有谁替代谁**：
+只有一套引擎：**X-ASR 160ms**（`stream-x-asr-160ms-zh-en-punct-int8`）。
 
-| 引擎 | 跑在哪 | 出字时机 | 首字延迟 | 模型 | 装完占磁盘 |
-|---|---|---|---|---|---|
-| **X-ASR**（`stream-x-asr-160ms-zh-en-punct-int8`） | **本进程内**，sherpa-onnx 直接调模型，不监听端口 | 说的时候逐字出，停约 1 秒定稿 | 约 0.4s（实测） | int8 量化，中英双语 + 标点 | 134MB |
-| **whisper**（`ggml-small-q5_1.bin` + VAD） | 独立子进程 `whisper-server`，走 HTTP | 说完一整句才出字 | 0.3s（GPU）/ 1.4s（CPU） | small-q5_1 | 190MB + 服务端 |
-
-设置面板 →「语音输入 → 识别引擎」三选一，**指定谁就先用谁，指定的那个不可用时自动换另一个兜底**：
-
-| 选项 | 行为 |
+| 项 | 值 |
 |---|---|
-| 自动 | 装了什么用什么：X-ASR 装了就走它，没装走 whisper |
-| X-ASR | 优先 X-ASR；模型不在或加载失败 → 改用 whisper，并在输入框上方提示一句 |
-| whisper | 优先 whisper-server；服务/模型没装 → 改用 X-ASR，同样有提示 |
+| 跑在哪 | **本进程内**，sherpa-onnx 的 `OnlineRecognizer` 直接调模型 |
+| 端口 / 地址 | **不需要**，不监听端口、不发 HTTP |
+| 出字时机 | 每 160ms 一块，边说边出；停约 1 秒自动定稿 |
+| 首字延迟 | 约 0.4s（实测） |
+| 模型 | int8 量化，中英双语，自带标点，134MB |
+| 实测 RTF | 0.19–0.24（4 线程） |
 
-**只有 whisper 需要「服务地址 + 端口」**：它靠 HTTP 收音频，所以设置里有端口和地址两项。
-X-ASR 在进程内推理，**不占端口、不需要地址**，那两项设置对它完全无效（界面上已标注）。
+设置面板 →「语音输入」只有两块：**模型状态**（未安装 → 下载 134MB → 已就绪/已加载）
+和 **启动时预加载**开关。
 
-#### X-ASR 流式识别的实现要点
+#### 实现要点
 
 - 引擎在 `core/src/stream_stt.rs`：sherpa-onnx 的 `OnlineRecognizer`，进程内常驻，
   一个会话一个 stream。音频 100ms 一块从 `pcm-recorder.ts` 的 `onFrame` 流出，
   经 base64 → Rust 解码成 `f32` → `accept_waveform`
 - **句末判定交给模型**（`rule1/rule2/rule3`）：`rule2 = 0.9s` 尾部静音算一句说完。
-  前端那套能量 VAD 仍然在跑，但只用来驱动麦克风的呼吸效果，不再参与切句
+  前端那套能量 VAD 仍然在跑，但只用来驱动麦克风的呼吸效果，不参与切句
 - **`finish()` 必须补 0.66 秒静音**：模型按 160ms 分块编码，最后不足一块的音频解不出字。
   实测「改成次要样式」不补零只会吐「改成次要样」
-- **标点由模型自带**（punct 版），Rust 侧只做繁转简 + 半角逗号转全角，不再走
-  `lib/punctuate.ts` 的补标点逻辑（`closeSegment` 见到已有标点会跳过）
-- 后处理刻意**不**复用 `clean_transcript`：那套按句丢幻听的规则是为整段 whisper 输出设计的，
-  套在半句话上会把正文一起清掉
+- **标点由模型自带**（punct 版），Rust 侧只做繁转简 + 半角逗号转全角；
+  `lib/punctuate.ts` 只在句末兜一个断句标点（`closeSegment` 见到已有标点会跳过）
+- 后处理刻意**不做**按句丢幻听：流式吐的是半句话，按句删会把正文一起清掉
 - 实测 RTF **0.19–0.24**（4 线程），20 秒长音频不退化；线程数上限卡在 4
   ——实测 8 线程反而降到 0.354，内存带宽先饱和
 - **IPC 三个命令**（`stt_stream_start` / `feed` / `stop`），数据全程走 Tauri IPC，
   不开 HTTP 端口——这也是它不需要「服务地址」的原因
+- 模型加载 2–5 秒，所以设置里的「启动时预加载」默认打开：启动 2 秒后由独立线程读盘，
+  点麦克风时已经就绪。关掉则退化为点麦克风时才加载（首次会等 1–2 秒）
 
 #### 发版前必须处理：DLL 分发（重要）
 
@@ -154,88 +151,53 @@ DLL 内部已经把 STL 静态链好了，我们只调 C API，所以不受本�
 `build.rs` 会自动把 4 个 DLL 拷到 `target/{debug,release}/`，**开发期无需任何操作**。
 
 但发版时这 4 个 DLL 必须和 `shania-agent.exe` **放在同一目录**——Windows 的 DLL 搜索顺序里
-`system32` 优先于 PATH，而 Windows 自带的 `C:\Windows\system32\onnxruntime.dll` 是个旧版本，
+`system32` 优先于 PATH，而 Windows 自带的 `C://Windows//system32//onnxruntime.dll` 是个旧版本，
 被加载到会直接崩（`The given version [28] is not supported` + `STATUS_ACCESS_VIOLATION`，
 实测踩过）。两条路：
 
 1. **推荐**：把 VS 2022 更新到 17.10+（MSVC 14.44），改回 `static`，回到单 exe 分发
 2. 留在 `shared`：用 NSIS `installerHooks` 把 4 个 DLL 装到 `$INSTDIR` 根目录
 
-whisper 那一半的设置面板 →「语音输入 → whisper 本地服务」：
-
-| 状态 | 含义 |
-|---|---|
-| 未安装 | 点「一键安装（约 190MB）」，下载 whisper.cpp 服务端 + small 模型到 `~/.shania/`，带进度条 |
-| 已安装，用到时自动启动 | 文件齐了，但「启动时预加载」被关掉，点麦克风时才拉起进程 |
-| 就绪（端口 xxxxx，CPU/GPU） | 进程在跑，端口默认 28080，被占时自动顺延 |
-
-字段说明（**这一组全部只对 whisper 生效**，X-ASR 不看它们）：
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| 启动时预加载 | **开** | 只预热当前指定的引擎：引擎是 X-ASR 时读模型进内存（约 500MB），是 whisper 时拉起进程（约 380MB）；关掉则都退化为用到才起 |
-| 推理后端 | `cpu` | `cpu` 开箱即用；`cuda` 走 NVIDIA 显卡，**额外下载约 650MB**，实测快 3–8 倍。没有 NVIDIA 显卡时该选项禁用 |
-| 服务端口 | `28080` | whisper 进程的监听端口，被占时自动往后找；填 `0` 表示每次随机 |
-| 识别服务地址 | 留空 | **留空 = 用内置本地 whisper 服务**；要接远程或自管服务才填，填到 `/v1` 为止。填了就不再检查本地是否安装 |
-| 识别模型 | `whisper-1` | 本地 whisper-server 忽略它（模型由启动参数决定）；接云端 OpenAI 才需要 |
-| 语言提示 | `zh` | 只对 whisper 生效，留空由服务端判断；X-ASR 是中英双语固定模型，不看这一项 |
-
-行为要点：
-
-- **实时分句转写**（`src/lib/pcm-recorder.ts`）：AudioWorklet 直接采 16k PCM，用能量 VAD 判断「这句说完了」（静音 450ms），一句结束立刻发一次转写并插入文字。用户还在说第二句时，第一句的字已经出来了。单句超过 8 秒强制切开，避免服务端上下文装不下
-- **不是真流式**：whisper-server 只收完整音频文件，「实时」是前端切句 + 串行队列模拟的，没有 token 级输出。真流式在 X-ASR 那条路
-- **CPU 上用 `-ac 450`**：whisper 默认把音频补零到 30 秒再编码（4 秒的话也按 30 秒算），把上下文缩到 9 秒实测 4.4s → 1.8s。GPU 版不加（本来就 0.3 秒，不值得冒截断风险）
-- **启动即预热**：`lib.rs` 的 setup 里调 `stt::preload()`，后台异步拉起，不阻塞窗口显示；没装则安静跳过，失败只打日志，不影响后续按需启动
-- 进程**起一次常驻、应用退出时杀**（`src-tauri/src/stt.rs`）；端口优先用设置的 28080，冲突则顺延 20 个，仍不行才交给系统随机
-- 端口上已经有 whisper-server（比如用户自己 `pnpm stt`）时直接复用，不再拉起第二份
-- **端口或后端改了会自动重启进程**——否则跑的还是旧参数/旧可执行文件
-- `--convert` 只是兜底，但**加了它 whisper-server 启动时就会在 PATH 里找 ffmpeg，找不到当场退出**，所以拉起进程时会自动把 `~/.shania/tools/ffmpeg/bin` 注入子进程 PATH
-- 子进程的 stdout/stderr 落到 `~/.shania/logs/stt.log`（每次启动覆盖）。起不来先看这个——缺 DLL、模型损坏、ffmpeg 找不到都只能从这里看出来
-- 下载地址可用 `SHANIA_STT_MODEL_URL` 覆盖（默认走 HuggingFace，国内可能很慢）
-- 模型按字节数校验，中断的下载会留下 `.part` 而不被误认为装好
-
-安装位置（都在 `~/.shania/` 下，与配置、会话同源）：
+安装位置：
 
 ```
-~/.shania/models/stream-x-asr-160ms-zh-en-punct-int8/    # X-ASR 模型，解压后约 230MB（encoder.int8/decoder/joiner/tokens）
-~/.shania/tools/whisper/Release/whisper-server.exe        # whisper CPU 版，b5454 官方预编译包（8.6MB）
-~/.shania/tools/whisper-cuda/Release/whisper-server.exe   # whisper GPU 版，自带 cudart/cublas，不必装 CUDA Toolkit（1.2GB）
-~/.shania/models/ggml-small-q5_1.bin                      # 182 MB，中文可用，两个后端共用
-~/.shania/tools/ffmpeg/bin/ffmpeg.exe                     # 可选，只有回退 webm 时才需要
+~/.shania/models/stream-x-asr-160ms-zh-en-punct-int8/    # X-ASR 模型，解压后约 230MB
+                                                          # （encoder.int8 / decoder.onnx / joiner.int8 / tokens.txt）
 ```
 
-下载地址可用环境变量指向镜像（默认走 GitHub release，国内可能很慢）：`SHANIA_STREAM_STT_URL`。
+下载地址可用 `SHANIA_STREAM_STT_URL` 指向镜像（默认走 GitHub release，国内可能很慢）。
+模型按字节数校验，中断的下载会留下 `.part` 而不被误认为装好。
 
-> 历史包袱：早期版本曾接过 SenseVoice-Small 做「定稿后再纠错」，实测中文净损失
-> （8 句样本 CER 1.36% vs 流式 0.00%），代码已整体删除。如果 `~/.shania/models/sense-voice-*`
-> 还在，可以手动删掉，当前程序不会再用它。
+#### 旧的 whisper 方案（已下线）
 
-#### 实测延迟（i7-11800H / RTX 3050 Laptop 4GB / small-q5_1）
+早期版本还接过 whisper-server（独立子进程 + HTTP + 前端能量切句），以及 SenseVoice 做
+「定稿后再纠错」。两者都实测不如 X-ASR：
+
+- whisper 要占一个端口、管一个子进程，服务拉起要 2–3 秒，说完一整句才出字，
+  静音和提示音还会编字幕
+- SenseVoice 纠错在中文短句上是净损失（8 句样本 CER 1.36% vs 流式 0.00%）
+
+相关代码已整体删除。**模型和脚本保留在磁盘上**，将来要接回来可以直接用：
+
+```
+~/.shania/tools/whisper/Release/whisper-server.exe        # CPU 版（8.6MB）
+~/.shania/tools/whisper-cuda/Release/whisper-server.exe   # GPU 版（1.2GB，自带 cudart/cublas）
+~/.shania/models/ggml-small-q5_1.bin                      # 182MB
+~/.shania/models/ggml-silero-v6.2.0.bin                   # 885KB，VAD
+~/.shania/models/sense-voice-zh-en-ja-ko-yue-2024-07-17/  # 229MB
+scripts/stt-server.ps1                                    # 手动起服务的脚本
+```
+
+`pnpm stt` / `pnpm stt:gpu` 仍然可用（内部就是 `scripts/stt-server.ps1`），
+只是桌面端不会再调用它——启动起来也没有客户端。
+
+#### 实测延迟（i7-11800H / RTX 3050 Laptop 4GB）
 
 | 场景 | 4 秒音频 | 8 秒音频 |
 |---|---|---|
-| CPU 默认参数（30 秒上下文） | 4.5 s | 4.4 s |
-| CPU + `-ac 450` | 1.4 s | 1.8 s |
-| GPU（CUDA） | 0.5 s | 0.3–0.5 s |
-
-显存占用约 **515 MB**，和 4GB 卡上的训练任务同时跑要留意。
-
-#### 手动起服务（调试 / CLI 用）
-
-`pnpm stt` 仍然保留，方便在命令行里单独验证（内部是 `scripts/stt-server.ps1`）：
-
-```powershell
-pnpm stt                                              # 默认 small + 28080 + CPU
-pnpm stt:gpu                                          # 用 CUDA 后端（要先装 GPU 版）
-powershell -File scripts/stt-server.ps1 -Port 8081    # 换端口
-powershell -File scripts/stt-server.ps1 -Backend cuda
-powershell -File scripts/stt-server.ps1 -Model C:\path\ggml-medium.bin
-```
-
-手动起的服务**会被桌面端复用**（`/health` 返回体同时含 `status` 和 `ok` 就认定是语音服务），不会另起一份。
-桌面端没在跑时，要把「识别服务地址」填成 `http://127.0.0.1:28080/v1`。
-
-- `--inference-path /v1/audio/transcriptions` 必须有，默认端点只有 `/inference`
+| X-ASR 流式（CPU，4 线程） | RTF 0.19–0.24，首字约 0.4s | 同左，不退化 |
+| whisper CPU + `-ac 450`（已下线） | 1.4 s | 1.8 s |
+| whisper GPU（已下线） | 0.5 s | 0.3–0.5 s |
 
 
 **MCP 工具**：配置文件 `~/.shania/mcp.json`（不存在视为没有 MCP）。
@@ -329,13 +291,13 @@ GUI 程序在 release 下没有控制台，`eprintln!` 等于把线索扔掉。�
 
 | 文件 | 内容 | 写入方式 |
 |---|---|---|
-| `shania.log` | 主日志：启动/退出、语音服务拉起、安装进度、MCP 警告、快捷键注册失败、坏的会话文件等 | 追加，**超过 5MB 下次启动轮转为 `.1`**（只留一份） |
-| `stt.log` | whisper-server 的 stdout/stderr | **每次启动覆盖** |
+| `shania.log` | 主日志：启动/退出、模型预加载、安装进度、MCP 警告、快捷键注册失败、坏的会话文件等 | 追加，**超过 5MB 下次启动轮转为 `.1`**（只留一份） |
+| `stt.log` | 旧的 whisper-server 输出（已下线，只有手动跑 `pnpm stt` 时才会写） | **每次启动覆盖** |
 | `mcp-<server>.log` | 每个 MCP server 的 stderr | **每次连接覆盖** |
 
 ```bash
 tail -f ~/.shania/logs/shania.log     # 主日志
-cat ~/.shania/logs/stt.log            # 语音服务起不来先看这个
+cat ~/.shania/logs/shania.log         # 语音识别问题看这里（搜「X-ASR」）
 ```
 
 一行一条，格式 `2026-11-11 21:40:42.935 INFO  内容`。
@@ -345,7 +307,6 @@ cat ~/.shania/logs/stt.log            # 语音服务起不来先看这个
 - `logging::init(dir)` 在 `run()` 最开头调用，桌面端和 CLI 都初始化；写不进去就退回 stderr，不影响程序
 - 宏 `log_info!` / `log_warn!` / `log_error!`，跨 crate 用 `shania_core::log_info!(...)`
 - 外部服务的原始输出由 `logging::service_log(dir, name)` 定位，**故意每次覆盖**：排查关心的是「这一次为什么失败」，历史由主日志保留
-- `stt.log` 里能看到 `ffmpeg is available.` 这类检查结果，`--convert` 相关的问题一眼就能定位
 
 ### 桌面端命令行参数
 
@@ -380,9 +341,8 @@ src-tauri/core/src/          ← Agent 核心，改这里会同时影响桌面�
   chat.rs         run_chat / run_agent_loop / consume_stream / test_connection / CancelRegistry
   tools.rs        内置工具定义与执行（4 个：时间/系统信息/读文件/列目录）+ is_builtin
   mcp.rs          MCP 客户端：stdio 启动 server、initialize / tools/list / tools/call
-  transcribe.rs   whisper 引擎的客户端：multipart 转发到 OpenAI 兼容 /audio/transcriptions
   stream_stt.rs   X-ASR 引擎：sherpa-onnx OnlineRecognizer，进程内推理（feature `stream-stt`）
-  stt_setup.rs    两个引擎共用的下载/解压/端口探测
+                  含模型下载/解压/路径推导
   events.rs       StreamEvent + EventSink trait
 
 src-tauri/cli/src/
@@ -397,9 +357,7 @@ src-tauri/src/               ← 桌面端命令层，Agent 逻辑一律不在�
   storage.rs      ~/.shania/sessions/<id>.json 按会话分文件读写（含聚合文件拆分迁移）
   settings.rs     ~/.shania/settings.json 原子读写（与 CLI 共用的设置文件）
   export.rs       导出落盘（write_text_file）/ 导入读取（read_import_file）
-  audio.rs        whisper 转写命令，转发 core::transcribe（X-ASR 的命令在 stt_stream.rs）
-  stt.rs          whisper 进程管理：安装、拉起、端口复用、退出时杀掉
-  stt_stream.rs   X-ASR 命令层：start / feed / stop / install / unload
+  stt_stream.rs   X-ASR 命令层：start / feed / stop / install / unload / status
 
 src/
   lib/types.ts        ← StreamEvent 联合类型、Message/Attachment/WireMessage/AppSettings
@@ -423,7 +381,7 @@ src/
 2. **真实模型连通性**：全程用 mock 验证协议层，还没连过真实 Qwen3-VL 服务，需人工填 baseURL 发一句验证。
 3. **托盘菜单肉眼确认**：菜单项文案（含快捷键后缀）已由 `update_tray_shortcut` 动态刷新，但程序读不到托盘文字，需实际看一眼。
 4. 打包跨平台：Windows 的 NSIS 可本机出包；macOS（.dmg/.app）与 Linux（.deb/.AppImage）需在对应系统上打包。
-5. **语音输入需真机验证**：AudioWorklet 采集与 VAD 切句、端口复用、GPU 后端切换这三条路径都只验证到「服务端能返回正确文本」，实际麦克风 → 文字全链路要在有麦的机器上点一遍。
+5. **语音输入需真机验证**：AudioWorklet 采集出帧、模型加载、定稿时机这三条路径都只验证到「Rust 侧能解出正确文本」，实际麦克风 → 文字全链路要在有麦的机器上点一遍。
 
 ### 功能扩展方向（按优先级建议）
 1. **扩充工具集**：目前仅 4 个内置玩具工具。框架已通（Rust 多轮循环 + 前端卡片），可加：文件读写、网页抓取、执行命令、调本地 API 等。建议每加一个工具补一条 e2e。
@@ -442,7 +400,7 @@ src/
 - `StreamEvent` 字段名与 Tauri 命令名都是**前后端契约**（`chat_stream` / `stop_chat` / `test_connection` / `take_cli_args`），改名必须同步改 `src/lib/types.ts` 与 `src/lib/api.ts`。
 - 新增工具只需改 `core/src/tools.rs` 两处（`definitions()` + `execute()`），顺便在 `is_builtin()` 里登记名字——否则工具循环会把它当 MCP 工具去转发。
 - 附件 `kind` 字段缺省视为 `image`：加这个字段之前存下的会话里只有图片，这样能直接兼容，不用写迁移。
-- 语音识别放在 Rust 侧转发（`core/transcribe.rs`）：一是绕开 WebView 的 CORS，二是 apiKey 不暴露给页面脚本。
+- 语音识别放在 Rust 侧（`core/stream_stt.rs`）：麦克风 PCM 经 Tauri IPC 直接进进程，不经 WebView 发 HTTP，绕开 CORS 也省掉一次序列化。
 - MCP server 的生命周期是「一轮对话」：`run_chat` 进来启动、出去 `kill`。想改成常驻要处理进程泄漏与状态失效，别随手改。
 - **构建前必须关掉正在运行的 release exe**。Windows 不允许覆盖运行中的文件，cargo 会报 `failed to remove file ... shania-agent.exe / 拒绝访问 (os error 5)`。同理，`tauri dev` 运行期间持有 `target/debug/.cargo-build-lock`，任何 cargo 命令都会「拒绝访问」——两者是不同的锁，都得先关进程。
 - **切换安装包类型会触发重新编译**。`tauri build` 会把 bundle 类型 patch 进 exe（日志里 `Patching ... with bundle type information: msi`），所以先打 nsis 再打 msi 时，即使源码没变也会重编一次（约 2 分钟）。只想要裸 exe 用 `--no-bundle`，不受影响。

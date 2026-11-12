@@ -1,9 +1,7 @@
-mod audio;
 mod chat;
 mod cli_args;
 mod export;
 mod settings;
-mod stt;
 mod stt_stream;
 mod storage;
 mod tools;
@@ -364,7 +362,6 @@ pub fn run() {
         .manage(ShortcutState::default())
         .manage(UiPrefs::default())
         .manage(TrayMenuState::default())
-        .manage(stt::SttState::default())
         .manage(stt_stream::StreamState::default())
         .invoke_handler(tauri::generate_handler![
             chat::chat_stream,
@@ -377,16 +374,12 @@ pub fn run() {
             settings::settings_location,
             export::write_text_file,
             export::read_import_file,
-            audio::transcribe_audio,
-            stt::stt_status,
-            stt::stt_install,
-            stt::stt_ensure,
-            stt::stt_stop,
             stt_stream::stt_stream_start,
             stt_stream::stt_stream_feed,
             stt_stream::stt_stream_stop,
             stt_stream::stt_stream_install,
             stt_stream::stt_stream_unload,
+            stt_stream::stt_stream_status,
             set_global_shortcut,
             set_close_action,
             cli_args::take_cli_args,
@@ -418,9 +411,9 @@ pub fn run() {
             }
             register_global_shortcut(handle);
 
-            // 语音引擎在后台预热（模型加载要几秒），不阻塞窗口显示。
-            // 只预热设置里指定的那个引擎；关掉「启动时预加载」就退回按需加载。
-            stt::preload(handle);
+            // 识别模型在后台预热（加载要几秒），不阻塞窗口显示。
+            // 设置里关掉「启动时预加载」就退回按需加载。
+            stt_stream::preload(handle);
 
             // 首启带参数时前端还没加载，先存着，等它挂载后主动来取。
             // 这里不能 emit——WebView 里的 JS 还不存在，事件会直接丢掉。
@@ -463,11 +456,10 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            // 退出时杀掉语音服务：Windows 上父进程死了子进程不会跟着走
+        .run(|_app, event| {
+            // 识别器是进程内常驻对象，进程退出即释放，没有子进程要收尾
             if let tauri::RunEvent::Exit = event {
                 shania_core::log_info!("Shania 退出");
-                stt::shutdown(app);
             }
         });
 }

@@ -1,30 +1,20 @@
 //! 流式语音识别：X-ASR 160ms 模型，走 sherpa-onnx 的 `OnlineRecognizer`，**进程内**推理。
 //!
-//! 和 [`crate::transcribe`] 那条路（whisper-server，一次一整段）本质区别是**什么时候出结果**：
+//! 它取代了早期那套 whisper-server 方案（独立子进程 + HTTP + 前端能量切句 + 900ms 重解码预览）。
+//! 那种做法的问题很实在：说完一整句才出字、静音和提示音会编出字幕、还要占一个端口和一套进程管理。
+//! 这里换成模型自己断句，音频块进来就喂，喂着就出字。
 //!
-//! | | X-ASR（这里） | whisper（`transcribe.rs`） |
-//! |---|---|---|
-//! | 跑在哪 | 进程内，sherpa-onnx 直接调模型 | 独立子进程 `whisper-server`，走 HTTP |
-//! | 出字 | 每 160ms 一块，边说边出 | 说完一句才开始编码 |
-//! | 首字延迟 | 约 400ms（实测） | 0.3s（GPU）～1.4s（CPU `-ac 450`） |
-//! | 标点 | 模型自带标点 token | 靠前端补（`lib/punctuate.ts`） |
-//! | 幻觉 | 实测静音/白噪声/提示音全空 | 静音/提示音会编字幕，要 VAD + 文本清洗两头堵 |
-//! | 需要地址/端口 | **不需要**，不监听任何端口 | 需要（默认 28080，可另填远程地址） |
-//!
-//! 所以这里不做能量切句、不做 partial 重解码：一个 session 一个 stream，音频进来就喂，
+//! 所以这里不做能量切句、也不做 partial 重解码：一个 session 一个 stream，音频进来就喂，
 //! endpoint 判定交给模型自己（`rule1/rule2/rule3`），断了就 reset 开始下一句。
-//!
-//! 两套引擎地位对等，**没有谁是谁的升级版**：`settings.sttEngine` 指定用哪个就先试哪个，
-//! 指定的这个不可用时自动换另一个兜底（`auto` 则是「X-ASR 装了就用它」）。判断依据：
-//! 这边只看模型文件是否齐全（[`ready`]），whisper 那边看服务端 + 模型是否装好。
 //!
 //! 模型是 X-ASR 160ms 的 int8 量化包（134MB），解压后四个文件。刻意用「按文件名前缀扫目录」
 //! 而不是写死 `encoder-epoch-99-avg-1.int8.onnx`：换个模型版本就得改代码，扫一遍更省事。
 
 use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sherpa_onnx::{
     OnlineModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineStream,
@@ -40,12 +30,67 @@ pub const DIR_NAME: &str = "stream-x-asr-160ms-zh-en-punct-int8";
 /// 固定 tag 的直链，不跟 latest 走：模型换了要重新实测延迟和准确率，不该悄悄变
 const MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-x-asr-160ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05.tar.bz2";
 
-/// 允许用镜像覆盖（国内直连 GitHub 经常只有几十 KB/s），和 whisper 那几个保持一致的做法
+/// 允许用镜像覆盖（国内直连 GitHub 经常只有几十 KB/s）
 pub fn model_url() -> String {
     std::env::var("SHANIA_STREAM_STT_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| MODEL_URL.to_string())
+}
+
+/// 流式下载模型包，每收到一块回调一次进度。
+///
+/// 回调按值传泛型而不是 `&mut dyn FnMut`：后者不满足 Send，
+/// Tauri 的 async command 要求整条 future 是 Send 的。
+///
+/// 先写 `.part`、完整了再改名：中断只会留下半个临时文件，不会被误认为装好。
+pub async fn download<F>(url: &str, dest: &Path, mut on_progress: F) -> Result<u64, String>
+where
+    F: FnMut(u64, Option<u64>) + Send,
+{
+    use futures_util::StreamExt;
+
+    if let Some(dir) = dest.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("创建目录失败：{e}"))?;
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("shania-agent")
+        // 134MB 在国内慢网下可能要十几分钟，超时给足
+        .timeout(Duration::from_secs(30 * 60))
+        .build()
+        .map_err(|e| format!("创建下载客户端失败：{e}"))?;
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("下载失败：{e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("下载失败：服务返回 {status}"));
+    }
+    let total = resp.content_length();
+
+    let tmp = dest.with_extension("part");
+    let mut file = File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
+    let mut got: u64 = 0;
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("下载中断：{e}"))?;
+        file.write_all(&chunk)
+            .map_err(|e| format!("写入失败：{e}"))?;
+        got += chunk.len() as u64;
+        on_progress(got, total);
+    }
+
+    file.flush().map_err(|e| format!("刷新文件失败：{e}"))?;
+    drop(file);
+
+    fs::rename(&tmp, dest).map_err(|e| format!("重命名失败：{e}"))?;
+    Ok(got)
 }
 
 pub fn dir(root: &Path) -> PathBuf {
@@ -375,18 +420,148 @@ impl Engine {
 
 /// 模型输出过一遍后处理。
 ///
-/// 只做三件事，**不**跑 [`crate::transcribe::clean_transcript`] 那一整套：那套是按
-/// 整段 whisper 输出设计的（按句丢幻听、丢掉超过一半就整段清空），套在流式的
-/// 半句话上会误伤——「谢谢观看」这种词出现在半句里时，一删就把整句清空了。
-/// 流式模型本来也不会吐 `(字幕:xxx)`，没有剥括号的必要。
+/// 只做三件事（繁转简 + 空白归一 + 标点规范化），**不**做按句丢幻听那套：
+/// 流式模型本来就很少在静音上编内容（实测静音/白噪声/提示音全空），而且它吐的是
+/// 半句话——按句删的规则套上去，一句里出现「谢谢观看」就会连正文一起清空。
 fn clean(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    // 这个模型偶尔吐繁体（「謝謝」），和 whisper 那边一样统一成简体
+    // 这个模型偶尔吐繁体（「謝謝」），统一成简体
     let simplified = crate::simplify::to_simplified(trimmed);
-    crate::transcribe::tidy(&simplified)
+    tidy(&simplified)
+}
+
+/// 空白归一 + 中文标点规范化。
+fn tidy(text: &str) -> String {
+    normalize_punctuation(&squeeze_spaces(text)).trim().to_string()
+}
+
+/// 中文文本里的标点规范化。
+///
+/// 模型主要三个毛病：半角逗号（「改一下,按钮太大了」）、叠在一起的标点（`，。`）、
+/// 标点后面多一个空格。英文句子完全不动——半角标点在英文里本来就是正确写法。
+fn normalize_punctuation(text: &str) -> String {
+    if !text.chars().any(is_cjk) {
+        return text.to_string();
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<char> = Vec::with_capacity(text.len());
+    for (i, &raw) in chars.iter().enumerate() {
+        // 只有紧跟在中文后面的半角标点才转全角。`So, my fellow` 里的逗号
+        // 是英文的正确写法，跟着一起改就成了 `So， my fellow`。
+        let c = if matches!(raw, ',' | '?' | '!' | ';')
+            && out
+                .iter()
+                .rev()
+                .find(|p| **p != ' ')
+                .is_some_and(|p| is_cjk(*p))
+        {
+            match raw {
+                ',' => '，',
+                '?' => '？',
+                '!' => '！',
+                _ => '；',
+            }
+        } else {
+            raw
+        };
+
+        if c == ' ' {
+            // 中文标点前后不该有空格：「改一下， 按钮」读起来是断的
+            if out.last().is_some_and(|p| is_cjk_punct(*p)) {
+                continue;
+            }
+            // 中文之间不留空格（中文不靠空格分词），中英之间要留（「我要用 VSCode」）
+            let prev_zh = out.last().is_some_and(|p| is_cjk(*p));
+            let next_zh = chars[i + 1..]
+                .iter()
+                .find(|x| **x != ' ')
+                .is_some_and(|x| is_cjk(*x));
+            if prev_zh && next_zh {
+                continue;
+            }
+            out.push(' ');
+            continue;
+        }
+
+        if is_cjk_punct(c) {
+            // 标点前刚压进来的空格要去掉
+            while out.last() == Some(&' ') {
+                out.pop();
+            }
+            // 相邻标点只留语气最强的一个：`，。` → `。`
+            if let Some(prev) = out.last().copied() {
+                if let Some(rank) = punct_rank(prev) {
+                    if punct_rank(c).unwrap_or(0) <= rank {
+                        continue;
+                    }
+                    out.pop();
+                }
+            }
+        }
+
+        out.push(c);
+    }
+
+    // 中文句子以半角句号收尾时换成全角。只在**文末、且前面是中文**时换：
+    // 句中的 `.` 可能是小数点（3.5）或省略号（`...`），英文句子的 `.` 更该保持半角。
+    while out.last() == Some(&' ') {
+        out.pop();
+    }
+    let n = out.len();
+    if n > 1 && out[n - 1] == '.' && out[n - 2] != '.' && is_cjk(out[n - 2]) {
+        out[n - 1] = '。';
+    }
+
+    out.into_iter().collect()
+}
+
+/// 语气强度，用来在叠在一起的标点里挑一个
+fn punct_rank(c: char) -> Option<u8> {
+    match c {
+        '。' => Some(3),
+        '！' | '？' => Some(2),
+        '，' | '；' | '：' => Some(1),
+        '、' => Some(0),
+        _ => None,
+    }
+}
+
+fn is_cjk_punct(c: char) -> bool {
+    punct_rank(c).is_some()
+        || matches!(
+            c,
+            '（' | '）' | '【' | '】' | '「' | '」' | '『' | '』' | '…' | '—'
+        )
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
+}
+
+/// 连续空白压成一个空格，顺便丢掉控制字符（模型偶尔吐 `\u{0}`）
+fn squeeze_spaces(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last_space = false;
+    for c in text.chars() {
+        if c.is_control() && c != '\n' {
+            continue;
+        }
+        if c.is_whitespace() {
+            if last_space {
+                continue;
+            }
+            last_space = true;
+            out.push(' ');
+            continue;
+        }
+        last_space = false;
+        out.push(c);
+    }
+    out.trim().to_string()
 }
 
 /// 线程数：流式这个模型很小，实测 4 线程最优，8 线程反而更慢（0.205 → 0.354），
@@ -403,7 +578,7 @@ pub(crate) fn thread_count() -> i32 {
 /// 前端把 `Float32Array` 的字节按小端编成 base64 传过来（比传 JSON 数字数组小 6 倍，
 /// 一次 150ms 音频约 12KB 文本）。
 pub fn decode_pcm(base64: &str) -> Result<Vec<f32>, String> {
-    let bytes = crate::transcribe::decode_audio(base64)?;
+    let bytes = decode_audio(base64)?;
     if bytes.len() % 4 != 0 {
         return Err(format!(
             "PCM 数据长度 {} 不是 4 的倍数，可能传进来的是 16bit 音频",
@@ -414,6 +589,18 @@ pub fn decode_pcm(base64: &str) -> Result<Vec<f32>, String> {
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect())
+}
+
+/// base64 → 字节，顺手兼容前端直接传 data URL 的情况
+fn decode_audio(data: &str) -> Result<Vec<u8>, String> {
+    let payload = data
+        .split_once("base64,")
+        .map(|(_, rest)| rest)
+        .unwrap_or(data);
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .map_err(|e| format!("音频数据解码失败：{e}"))
 }
 
 #[cfg(test)]

@@ -4,9 +4,8 @@
 //! 这里解成采样喂给 [`shania_core::stream_stt::Engine`]，返回「当前整句」和
 //! 「这一轮结束的句子」。识别器进程内常驻，模型只读一次盘。
 //!
-//! 注意这条链路**不监听端口、不发 HTTP**：麦克风数据经 Tauri IPC 直接进进程，
-//! 所以设置里的「服务端口」「识别服务地址」对 X-ASR 完全无效——那两项是给
-//! whisper-server 那条路用的。
+//! 注意这条链路**不监听端口、不发 HTTP**：麦克风数据经 Tauri IPC 直接进进程。
+//! 这也是它取代 whisper-server 的主要原因之一——不用管端口占用，不用管子进程退出。
 //!
 //! 为什么不用 event 往前推：一次 feed 就是一次请求-响应，前端天然知道
 //! 「这批音频处理完了、文本是这个」，不用维护事件生命周期，也不用担心
@@ -17,10 +16,9 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
-use shania_core::stt_setup;
 use shania_core::stream_stt::{self, Engine, Feed};
 
-/// 流式模型没装好：前端据此决定「换 whisper 兜底」还是「提示去安装」
+/// 模型没装好：前端据此提示「去设置里下载模型」
 pub const STREAM_NOT_INSTALLED: &str = "STREAM_NOT_INSTALLED";
 
 pub struct StreamState {
@@ -161,7 +159,7 @@ pub async fn stt_stream_install(app: AppHandle) -> Result<(), String> {
     shania_core::log_info!("下载流式识别模型：{url}");
 
     let app_progress = app.clone();
-    let got = stt_setup::download(&url, &archive, |done, total| {
+    let got = stream_stt::download(&url, &archive, |done, total| {
         let _ = app_progress.emit(
             "stt-progress",
             Progress {
@@ -214,13 +212,34 @@ pub async fn stt_stream_install(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 给 `stt_status` 用的字段：(X-ASR 已装, 磁盘占用, 是否已加载进内存)
-pub fn status_bits(root: &std::path::Path, state: &StreamState) -> (bool, u64, bool) {
-    (
-        stream_stt::ready(root),
-        stream_stt::size(root),
-        state.engine.loaded(),
-    )
+/// 模型状态：装没装、占多少磁盘、有没有加载进内存。
+///
+/// 设置面板只关心这几件事，所以单独开一个命令。以前这些字段混在一个
+/// 包含 whisper 服务端/端口/后端的大状态结构里，那半边已经全删了。
+#[tauri::command]
+pub fn stt_stream_status(state: State<'_, StreamState>) -> StreamStatus {
+    let Ok(root) = root_dir() else {
+        return StreamStatus::default();
+    };
+    StreamStatus {
+        ready: stream_stt::ready(&root),
+        bytes: stream_stt::size(&root),
+        loaded: state.engine.loaded(),
+        dir: stream_stt::dir(&root).to_string_lossy().to_string(),
+    }
+}
+
+#[derive(Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamStatus {
+    /// 四个模型文件是否齐全
+    ready: bool,
+    /// 磁盘占用
+    bytes: u64,
+    /// 识别器是否已加载进内存
+    loaded: bool,
+    /// 模型目录，设置面板上显示给用户看
+    dir: String,
 }
 
 /// 启动后把 X-ASR 模型读进内存。
@@ -228,13 +247,16 @@ pub fn status_bits(root: &std::path::Path, state: &StreamState) -> (bool, u64, b
 /// 模型加载实测 2-5 秒（debug 5 秒、release 约 2 秒），等用户点麦克风才开始读，
 /// 就又变回「点了半天没反应」——那正是换 X-ASR 要解决的问题本身。
 ///
-/// 由 `stt::preload` 按设置里的引擎决定叫不叫它：引擎是 whisper 时不该白占这 134MB。
-///
 /// 刻意延后 2 秒、并且用独立线程：启动瞬间前端在渲染、窗口在画，这时候抢 CPU
 /// 读 134MB 只会让冷启动更难看。用 std::thread 而不是 tokio 任务，是因为加载
 /// 本身是阻塞 IO + 同步推理初始化，放进 async 池会占掉一个 worker。
 pub fn preload(app: &AppHandle) {
     use tauri::Manager;
+
+    // 设置里关掉了「启动时预加载」就不预热，等用户点麦克风时再读盘
+    if !preload_enabled() {
+        return;
+    }
 
     let Ok(root) = root_dir() else {
         return;
@@ -252,9 +274,21 @@ pub fn preload(app: &AppHandle) {
         if !state.engine.loaded() {
             match state.engine.start(&root) {
                 Ok(()) => shania_core::log_info!("X-ASR 流式识别模型已预加载"),
-                // 预加载失败不影响可用性：点麦克风时还会再试一次，真起不来就用 whisper 兜底
+                // 预加载失败不影响可用性：点麦克风时还会再试一次
                 Err(err) => shania_core::log_warn!("X-ASR 流式识别模型预加载失败：{err}"),
             }
         }
     });
+}
+
+/// 「启动时预加载」开关。缺字段按开处理——老设置文件里没有这一项，
+/// 而它的默认行为一直是开机就加载。
+fn preload_enabled() -> bool {
+    let Ok(Some(raw)) = crate::settings::load_settings() else {
+        return true;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("sttPreload").and_then(|b| b.as_bool()))
+        .unwrap_or(true)
 }
