@@ -122,6 +122,13 @@ function canCutAt(buf: string, i: number): boolean {
 }
 
 /**
+ * `| --- | --- |` 这种表格分隔行。念不出来，还会白占一次合成。
+ */
+function isTableRule(text: string): boolean {
+  return /^[\s|:\-—]+$/.test(text)
+}
+
+/**
  * 把 LLM 的增量文本切成适合合成的句子。
  *
  * 和 `core/src/tts.rs` 里的 `Splitter` 是同一套规则，只是这边必须在浏览器里跑
@@ -131,10 +138,13 @@ function canCutAt(buf: string, i: number): boolean {
  *   - 首句从第一个句末标点切，最短 6 字——用户等的是第一声，不是整段
  *   - 后续句取最后一个句末标点，合并得更多、语调更连贯
  *   - 没有标点时按软阈值（逗号）和硬上限兜底，避免长段无限等
+ *   - ``` 代码块与表格分隔行整段跳过，不送进合成器
  */
 class Splitter {
   private buf = ''
   private first = true
+  /** 正在一段 ``` 代码块里 */
+  private inFence = false
 
   push(delta: string): string[] {
     if (!delta) return []
@@ -149,12 +159,21 @@ class Splitter {
       const forced = !SENTENCE_END.includes(marker) && !SOFT_BREAK.includes(marker)
       let sentence = this.buf.slice(0, cut).trim()
       this.buf = this.buf.slice(cut)
+      this.first = false
       // 强行截断的地方补个逗号：合成器对没有标点的长句处理不好，
       // 最后一个字经常被吞（实测「把现象记」只剩「把现象」）
       if (forced && sentence) sentence += '，'
+
+      // 代码块整段不念：块里的 `for line in buf` 在 Kokoro 的英文词表里查得到
+      // for/in/line，会被一本正经念成英文；matcha 则删光英文只剩括号，白合成一段静音
+      const fences = sentence.split('```').length - 1
+      if (fences > 0) {
+        if (fences % 2 === 1) this.inFence = !this.inFence
+        continue
+      }
+      if (this.inFence || isTableRule(sentence)) continue
       // 只有标点的片段丢掉：合成器对它返回空音频，白白占一次 IPC
       if (sentence && speakable(sentence)) out.push(sentence)
-      this.first = false
       if (!this.buf) break
     }
     return out
@@ -164,12 +183,16 @@ class Splitter {
     const rest = this.buf.trim()
     this.buf = ''
     this.first = true
-    return rest && speakable(rest) ? rest : null
+    // 代码块没闭合就到结尾了：剩下的同样不念
+    const fenced = this.inFence
+    this.inFence = false
+    return !fenced && rest && speakable(rest) ? rest : null
   }
 
   reset() {
     this.buf = ''
     this.first = true
+    this.inFence = false
   }
 
   private findCut(): number {

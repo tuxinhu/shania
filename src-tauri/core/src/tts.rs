@@ -687,6 +687,32 @@ fn sanitize_with(text: &str, latin: &Latin) -> String {
             continue;
         }
 
+        // 一串 ASCII 符号（`://`、`+`、`/`、代码里的 `() {`）基本只会来自路径、
+        // 代码或 markdown 结构。中文合成器会把它们念成「冒号斜杠斜杠」，或者
+        // 直接卡住不吐音——听感就是句子中间空了一截。
+        // 夹在数字中间的例外：`3.14`、`3:20` 是有意义的读数，交给后面的逻辑。
+        if is_speech_noise(raw) {
+            let prev_digit = prev.is_some_and(|c| c.is_ascii_digit());
+            let next_digit = it.peek().is_some_and(|c| c.is_ascii_digit());
+            if !(prev_digit && next_digit) {
+                let mut len = 1;
+                while it.peek().is_some_and(|c| is_speech_noise(*c)) {
+                    it.next();
+                    len += 1;
+                }
+                // 单个句读符号换成中文标点，停顿还在（`1: 打开设置`）；
+                // 成串的是路径/代码残留，整段丢（`://`、`+`）
+                if let (1, Some(pause)) = (len, ascii_pause(raw)) {
+                    if prev != Some(pause) {
+                        out.push(pause);
+                        prev = Some(pause);
+                        prev_space = false;
+                    }
+                }
+                continue;
+            }
+        }
+
         // 换行在朗读里通常该是个停顿，但合成器自己有停顿模型，给空格更安全
         let ch = match raw {
             '\n' | '\r' | '\t' => ' ',
@@ -715,6 +741,26 @@ fn sanitize_with(text: &str, latin: &Latin) -> String {
     }
 
     out.trim().to_string()
+}
+
+/// 中文朗读里没有任何意义的 ASCII 符号。
+///
+/// `%` 与 `‰` 留着：它们参与读数（「98.5%」读成「百分之九十八点五」）。
+fn is_speech_noise(ch: char) -> bool {
+    ch.is_ascii_punctuation() && !matches!(ch, '%' | '‰')
+}
+
+/// ASCII 句读符号对应的中文标点。翻成中文标点是为了留住那个停顿：
+/// 「步骤 1: 打开设置」直接删掉冒号会读成「打开设置」前面毫无停顿。
+fn ascii_pause(ch: char) -> Option<char> {
+    match ch {
+        ',' => Some('，'),
+        ':' => Some('：'),
+        ';' => Some('；'),
+        '!' => Some('！'),
+        '?' => Some('？'),
+        _ => None,
+    }
 }
 
 /// 这段文本里有没有合成器能念出来的东西。
@@ -768,6 +814,8 @@ fn is_emoji(ch: char) -> bool {
 pub struct Splitter {
     buf: String,
     first: bool,
+    /// 正在一段 ``` 代码块里。代码块整段不念——见 `push` 里的说明。
+    in_fence: bool,
 }
 
 /// 首句允许的最短长度（字）。比这更短的句末标点会被跳过，避免「好的。」单独合成。
@@ -795,10 +843,16 @@ impl Splitter {
         Self {
             buf: String::new(),
             first: true,
+            in_fence: false,
         }
     }
 
     /// 喂增量文本，返回所有已经可以合成的句子。
+    ///
+    /// 代码块整段丢掉，不只是丢掉「```」这两个符号：块里的
+    /// `for line in buf.split_inclusive` 在 Kokoro 的英文词表里能查到 for/in/line，
+    /// 于是被一本正经念成英文；matcha 则删光英文只剩一串括号，白跑一次合成还
+    /// 留一段静音。两种都不该出声。
     pub fn push(&mut self, delta: &str) -> Vec<String> {
         if delta.is_empty() {
             return Vec::new();
@@ -812,11 +866,21 @@ impl Splitter {
                 break;
             };
             let text = sentence.trim().to_string();
-            if text.is_empty() || !speakable(&text) {
+            self.first = false;
+            // 围栏行翻转状态并丢掉；块内的一律不念。
+            // 必须在 speakable 之前判断：收尾的 ``` 本身没有可念的字，
+            // 先被当成「纯标点」丢掉的话，状态就永远关不上。
+            let fences = text.matches("```").count();
+            if fences > 0 {
+                if fences % 2 == 1 {
+                    self.in_fence = !self.in_fence;
+                }
+                continue;
+            }
+            if self.in_fence || text.is_empty() || !speakable(&text) || is_table_rule(&text) {
                 continue;
             }
             out.push(text);
-            self.first = false;
         }
         out
     }
@@ -826,7 +890,9 @@ impl Splitter {
         let rest = self.buf.trim().to_string();
         self.buf.clear();
         self.first = true;
-        if rest.is_empty() || !speakable(&rest) {
+        // 代码块没闭合就到结尾了：剩下的同样不念
+        let fenced = std::mem::take(&mut self.in_fence);
+        if fenced || rest.is_empty() || !speakable(&rest) {
             None
         } else {
             Some(rest)
@@ -837,6 +903,7 @@ impl Splitter {
     pub fn reset(&mut self) {
         self.buf.clear();
         self.first = true;
+        self.in_fence = false;
     }
 
     fn take_ready(&mut self) -> Option<String> {
@@ -902,6 +969,12 @@ impl Splitter {
         self.buf = self.buf[cut..].to_string();
         Some(sentence)
     }
+}
+
+/// `| --- | --- |` 这种表格分隔行。念不出来，还会白占一次合成。
+fn is_table_rule(text: &str) -> bool {
+    text.chars()
+        .all(|c| matches!(c, '|' | ':' | '-' | '—' | ' ' | '\t'))
 }
 
 fn is_sentence_end(ch: char) -> bool {
@@ -1034,6 +1107,49 @@ mod tests {
         assert!(s.push("好的我明白了。").len() == 1);
         assert!(s.push("。。。。。。").is_empty());
         assert!(s.flush().is_none());
+    }
+
+    #[test]
+    fn sanitize_drops_symbol_islands() {
+        // 路径、代码、markdown 结构留下的符号串：念出来是「冒号斜杠斜杠」
+        assert_eq!(sanitize("我看了 I:/project/agent-ui 的结构"), "我看了 的结构");
+        assert_eq!(sanitize("这是一个 Tauri + Vite + Vue 3 项目"), "这是一个 3 项目");
+        assert_eq!(sanitize("模块 A | 模块 B"), "模块 模块");
+        // 单个句读符号翻成中文标点，停顿不能丢
+        assert_eq!(sanitize("步骤 1: 打开设置"), "步骤 1： 打开设置");
+        assert_eq!(sanitize("先这样,再那样"), "先这样，再那样");
+        // 数字里的符号是读数的一部分，不能删
+        assert_eq!(sanitize("成功率 98.5%"), "成功率 98.5%");
+        assert_eq!(sanitize("3:20 开会"), "3:20 开会");
+    }
+
+    #[test]
+    fn splitter_skips_code_fences() {
+        let mut s = Splitter::new();
+        assert_eq!(s.push("我看一下实现。"), vec!["我看一下实现。"]);
+        // 围栏行翻转状态并丢掉，块里的内容一句都不念
+        assert!(s.push("```rust\n").is_empty());
+        assert!(s.push("for line in buf {\n").is_empty());
+        assert!(s.push("    let a = 1;\n").is_empty());
+        assert!(s.push("```\n").is_empty());
+        assert_eq!(s.push("看完了，没问题。"), vec!["看完了，没问题。"]);
+    }
+
+    #[test]
+    fn splitter_skips_unclosed_fence_at_end() {
+        let mut s = Splitter::new();
+        assert!(s.push("```python\nprint(1)").is_empty());
+        // 块没闭合就到结尾：剩下的同样不念，不然「print(1)」会被念出来
+        assert!(s.flush().is_none());
+    }
+
+    #[test]
+    fn splitter_skips_table_rule() {
+        let mut s = Splitter::new();
+        assert!(s.push("| --- | --- | --- |\n").is_empty());
+        assert!(s.flush().is_none());
+        // 下一句照常念，状态没被带坏
+        assert_eq!(s.push("表格完了，接着说。"), vec!["表格完了，接着说。"]);
     }
 
     #[test]
