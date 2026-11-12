@@ -129,6 +129,20 @@ function isTableRule(text: string): boolean {
 }
 
 /**
+ * 一次切分的结果。
+ *
+ * 分开保存是为了两件事互不干扰：`raw` 原样写进会话，`\n`、表格竖线、代码围栏都还在，
+ * 会话里渲染出来还是原样的排版；`speech` 是清洗过、适合念的版本。
+ * 只留 `speech` 会把整段回答压成一行——实测会话里就是这样：
+ * 「## 目录扫描完成我看了 …的结构| 层 | 位置 | 职责 || --- | --- | ---|」。
+ */
+interface Segment {
+  raw: string
+  /** null 表示这段不念（代码块、表格分隔行、纯标点） */
+  speech: string | null
+}
+
+/**
  * 把 LLM 的增量文本切成适合合成的句子。
  *
  * 和 `core/src/tts.rs` 里的 `Splitter` 是同一套规则，只是这边必须在浏览器里跑
@@ -146,10 +160,10 @@ class Splitter {
   /** 正在一段 ``` 代码块里 */
   private inFence = false
 
-  push(delta: string): string[] {
+  push(delta: string): Segment[] {
     if (!delta) return []
     this.buf += delta
-    const out: string[] = []
+    const out: Segment[] = []
     // 上限保护：异常输入（模型把整篇文档吐进来）不能在这里死循环
     for (let guard = 0; guard < 8; guard += 1) {
       const cut = this.findCut()
@@ -157,36 +171,41 @@ class Splitter {
       // 切点前一个字符不是标点时，说明是按硬上限强行截断的
       const marker = this.buf[cut - 1] ?? ''
       const forced = !SENTENCE_END.includes(marker) && !SOFT_BREAK.includes(marker)
-      let sentence = this.buf.slice(0, cut).trim()
+      const raw = this.buf.slice(0, cut)
       this.buf = this.buf.slice(cut)
       this.first = false
+
+      const text = raw.trim()
       // 强行截断的地方补个逗号：合成器对没有标点的长句处理不好，
-      // 最后一个字经常被吞（实测「把现象记」只剩「把现象」）
-      if (forced && sentence) sentence += '，'
+      // 最后一个字经常被吞（实测「把现象记」只剩「把现象」）。
+      // 只补在朗读版本上，会话里那份保持原样。
+      const spoken = forced && text ? `${text}，` : text
 
       // 代码块整段不念：块里的 `for line in buf` 在 Kokoro 的英文词表里查得到
       // for/in/line，会被一本正经念成英文；matcha 则删光英文只剩括号，白合成一段静音
-      const fences = sentence.split('```').length - 1
+      const fences = text.split('```').length - 1
       if (fences > 0) {
         if (fences % 2 === 1) this.inFence = !this.inFence
+        out.push({ raw, speech: null })
         continue
       }
-      if (this.inFence || isTableRule(sentence)) continue
-      // 只有标点的片段丢掉：合成器对它返回空音频，白白占一次 IPC
-      if (sentence && speakable(sentence)) out.push(sentence)
-      if (!this.buf) break
+      // 表格分隔行、纯标点、块内代码同理：会话里留着，但不念
+      const quiet = this.inFence || isTableRule(spoken) || !spoken || !speakable(spoken)
+      out.push({ raw, speech: quiet ? null : spoken })
     }
     return out
   }
 
-  flush(): string | null {
-    const rest = this.buf.trim()
+  flush(): Segment | null {
+    const raw = this.buf
     this.buf = ''
     this.first = true
     // 代码块没闭合就到结尾了：剩下的同样不念
     const fenced = this.inFence
     this.inFence = false
-    return !fenced && rest && speakable(rest) ? rest : null
+    if (!raw.trim()) return null
+    const text = raw.trim()
+    return { raw, speech: !fenced && speakable(text) ? text : null }
   }
 
   reset() {
@@ -425,15 +444,19 @@ export class VoiceConversation {
           switch (event.type) {
             case 'content': {
               this.state.reply += event.delta
-              for (const sentence of this.splitter.push(event.delta)) {
-                this.speak(sentence, turn)
+              for (const segment of this.splitter.push(event.delta)) {
+                this.hear(segment)
+                if (segment.speech) this.speak(segment.speech, turn)
               }
               this.emit()
               break
             }
             case 'done': {
               const rest = this.splitter.flush()
-              if (rest) this.speak(rest, turn)
+              if (rest) {
+                this.hear(rest)
+                if (rest.speech) this.speak(rest.speech, turn)
+              }
               this.generating = false
               // 真正的提交等播放队列排空（见 tick）
               this.pendingCommit = true
@@ -459,6 +482,17 @@ export class VoiceConversation {
   }
 
   /**
+   * 记下「用户听到了这段」。
+   *
+   * 写的是原文片段，不是清洗后的朗读稿：清洗会把 `\n`、表格竖线、代码围栏都吃掉，
+   * 拼起来就是一根长条（「## 目录扫描完成我看了…| 层 | 位置 | 职责 || --- |」），
+   * 会话里再渲染就跟没格式一样。打断时这份截断的记录也仍然是完整的 markdown。
+   */
+  private hear(segment: Segment) {
+    this.state.heard += segment.raw
+  }
+
+  /**
    * 合成一句并排进播放队列。
    *
    * 走串行链：`tts_say` 是异步的，两句并发发出去回来的顺序不保证，
@@ -473,9 +507,6 @@ export class VoiceConversation {
         // 合成期间可能已经被打断
         if (turn !== this.turnId) return
         this.engine?.enqueue(speech.pcm, speech.rate)
-        // 近似：入队即算「听到」。打断时可能多记一句，对话历史里无关紧要
-        this.state.heard += sentence
-        this.emit()
       })
       .catch((err) => {
         if (turn !== this.turnId) return
