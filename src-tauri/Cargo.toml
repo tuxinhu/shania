@@ -1,0 +1,43 @@
+[package]
+name = "shania-agent"
+version = "0.1.0"
+description = "Shania Agent · 桌面智能体"
+authors = ["shania"]
+edition = "2021"
+rust-version = "1.77.2"
+
+# 桌面端只负责「窗口 + 命令层」；Agent 逻辑在 core，命令行程序在 cli。
+# 三者共用一个 target 目录，依赖只编译一次。
+[workspace]
+members = ["core", "cli"]
+resolver = "2"
+
+[lib]
+name = "shania_agent_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+shania-core = { path = "core", features = ["stream-stt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 只为了 tokio::sync::Mutex：语音服务的启动要串行化（见 stt.rs 的 ensure_running）
+tokio = { version = "1", features = ["sync"], default-features = false }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

@@ -1,0 +1,50 @@
+{
+  "name": "shania-agent",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Shania Agent · 桌面智能体",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "app:dev": "tauri dev",
+    "app:build": "tauri build",
+    "mock": "node scripts/mock-llm.mjs",
+    "stt": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stt-server.ps1",
+    "stt:gpu": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stt-server.ps1 -Backend cuda",
+    "cli": "cargo run --manifest-path src-tauri/Cargo.toml -p shania-cli --",
+    "cli:build": "cargo build --manifest-path src-tauri/Cargo.toml -p shania-cli --release",
+    "test:context": "node scripts/test-context.mjs",
+    "test:export": "node scripts/test-export.mjs",
+    "e2e:chat": "node scripts/e2e-chat.mjs",
+    "e2e:image": "node scripts/e2e-image.mjs",
+    "e2e:ui": "node scripts/e2e-ui.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-autostart": "^2.7.0",
+    "@tauri-apps/plugin-dialog": "^2.8.4",
+    "@tauri-apps/plugin-opener": "^2.5.0",
+    "@tauri-apps/plugin-process": "^2.4.0",
+    "@tauri-apps/plugin-updater": "^2.14.1",
+    "highlight.js": "^11.12.0",
+    "markdown-it": "^15.0.3",
+    "pinia": "^4.1.0",
+    "vue": "^3.5.45"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4",
+    "@types/node": "^26.6.6",
+    "@vitejs/plugin-vue": "^6.0.10",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.8",
+    "vue-tsc": "^3.3.14"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

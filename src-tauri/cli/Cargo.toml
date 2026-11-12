@@ -1,0 +1,23 @@
+[package]
+name = "shania-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+description = "Shania Agent 的命令行界面"
+
+# 可执行文件名是 shania，跟桌面端的 shania-agent 区分开
+[[bin]]
+name = "shania"
+path = "src/main.rs"
+
+[dependencies]
+shania-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "net",
+  "time",
+  "io-std",
+  "io-util",
+] }
