@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import Icon from './Icon.vue'
+import ResizeHandle from './ResizeHandle.vue'
 import WindowControls from './WindowControls.vue'
 import { exportSession } from '@/lib/export'
 import { pickSessionsToImport } from '@/lib/importer'
@@ -372,6 +373,17 @@ onUnmounted(() => {
     <Transition name="toast">
       <div v-if="importToast" class="import-toast">{{ importToast }}</div>
     </Transition>
+
+    <!-- 右缘拖宽：宽度写进 --sidebar-w，消息列的居中补偿会自动跟着重算 -->
+    <ResizeHandle
+      variable="--sidebar-w"
+      store="shania.sidebarW"
+      :min="220"
+      :max="420"
+      :initial="268"
+      grow="right"
+      class="sidebar-handle"
+    />
   </aside>
 
   <Teleport to="body">
@@ -412,6 +424,11 @@ onUnmounted(() => {
   border-right: 1px solid var(--line-soft);
   min-height: 0;
   position: relative;
+}
+
+/* 拖宽把手贴右缘 */
+.sidebar-handle {
+  right: -4px;
 }
 
 /* ---------- 顶部交通灯 ---------- */

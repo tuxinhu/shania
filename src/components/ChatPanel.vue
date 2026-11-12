@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import ChatComposer from './ChatComposer.vue'
 import EmptyState from './EmptyState.vue'
 import Icon from './Icon.vue'
@@ -87,7 +87,39 @@ watch(
 onMounted(() => {
   void toBottom()
   composer.value?.focus()
+
+  // 消息列的居中补偿要拿「对话区有多宽」参与 clamp，宽度和列宽都得动态上报
+  syncDialogVars()
+  dialogObserver = new ResizeObserver(syncDialogVars)
+  if (scroller.value) dialogObserver.observe(scroller.value)
+  window.addEventListener('resize', syncDialogVars)
 })
+
+onUnmounted(() => {
+  dialogObserver?.disconnect()
+  window.removeEventListener('resize', syncDialogVars)
+})
+
+/**
+ * 把对话区宽度和消息列实际宽度写给 CSS。
+ *
+ * 对话列在「侧栏 268 / 右栏 46」之间居中，但两侧宽度不对称——左留白看起来
+ * 比右边宽一大截。修法是把列往左挪 (右栏宽 - 侧栏宽) / 2；可这个补偿在窄窗口
+ * 会把列推进侧栏底下，所以挪多少要 clamp 在「左右各自剩余空隙」之内，
+ * 而空隙只有 JS 知道（列宽随窗口伸缩），只能在这算好递给 CSS。
+ */
+let dialogObserver: ResizeObserver | null = null
+
+function syncDialogVars() {
+  const el = scroller.value
+  if (!el) return
+  const width = el.clientWidth
+  // .inner 的实际宽 = min(800, 宽 - 28*2 水平 padding)，和 CSS 保持同一套数字
+  const column = Math.min(800, width - 56)
+  const rootStyle = document.documentElement.style
+  rootStyle.setProperty('--dialog-w', `${width}px`)
+  rootStyle.setProperty('--dialog-col', `${column}px`)
+}
 
 function pick(text: string) {
   composer.value?.setDraft(text)
@@ -253,6 +285,15 @@ function pick(text: string) {
   max-width: 800px;
   min-height: 100%;
   margin: 0 auto;
+  /* 居中补偿：往左挪 (右栏总宽 - 侧栏宽) / 2，让两侧「视觉留白」相等。
+     但窄窗口时这个量会把列推进侧栏/右栏底下，所以 clamp 在左右空隙之内——
+     空隙由上面的 syncDialogVars 动态上报 */
+  position: relative;
+  left: clamp(
+    calc((var(--dialog-w, 900px) - var(--dialog-col, 800px)) / -2),
+    calc((var(--rail-w, 46px) - var(--sidebar-w, 268px)) / 2),
+    calc((var(--dialog-w, 900px) - var(--dialog-col, 800px)) / 2)
+  );
   padding: 26px 28px 10px;
   display: flex;
   flex-direction: column;
