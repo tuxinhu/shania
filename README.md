@@ -52,7 +52,7 @@ WebView2 与托盘。拆开后 CLI 二进制只含 reqwest + serde，Agent 逻�
 - 流式对话 + Markdown 渲染 + 代码高亮
 - 图片上传（>1.2MB 自动重编码，长边 1568，PNG 保透明），支持视觉模型
 - **文本附件**：md / json / csv / 代码等文本文件读成正文注入上下文（单文件 ≤512KB、注入 ≤20 万字，超出截断并注明）；二进制文件明确拒绝，不假装能理解
-- **语音输入**：边说边转——AudioWorklet 采 PCM，静音切句，每句结束立刻 `POST /audio/transcriptions`，文字实时填入光标处（见下方「语音与 MCP」）
+- **语音输入**：两套引擎可指定、互为兜底——X-ASR（进程内、边说边出字）与 whisper-server（HTTP、整段转写），文字实时填入光标处（见下方「语音与 MCP」）
 - 失败重试、编辑重发、删除消息
 - 上下文自动裁剪（token 估算：中文 1.05 token/字，图片 1200 token，超限时首部插「已省略 N 条」）
 - Agent 工具调用：Rust 侧多轮循环，前端显示工具卡片 + 结果折叠
@@ -74,7 +74,7 @@ WebView2 与托盘。拆开后 CLI 二进制只含 reqwest + serde，Agent 逻�
 ### 设置与交付
 - 多模型配置 profiles：baseURL / apiKey / 模型名，一键切换 + 连接测试
 - **深色主题**：浅色 / 深色 / 跟随系统，首屏前由内联脚本定主题（不闪白）
-- 语音识别配置：STT 模型名 + 语言提示，复用同一套接口地址与 API Key
+- 语音识别配置：引擎三选一（自动 / X-ASR / whisper）+ 启动预加载；端口与地址只对 whisper 生效
 - 会话导出 Markdown / JSON
 - 自动更新骨架（updater 插件已接入，见"未完成"）
 
@@ -107,27 +107,25 @@ pnpm stt            # 起本地语音识别服务（127.0.0.1:28080，见下节�
 **语音输入**：桌面端自带本地语音的**安装 + 启动**，不需要用户自己编译或起进程。
 **边说边转**——不用等点「结束」，说的时候字就跟着往外冒。
 
-两套引擎并存，默认「自动」：
+两套引擎，**地位对等、没有谁替代谁**：
 
-| 引擎 | 出字时机 | 首字延迟 | 模型 | 装完占磁盘 |
-|---|---|---|---|---|
-| **流式**（X-ASR 160ms zipformer，推荐） | 说的时候逐字出，停约 1 秒定稿 | **约 0.4s**（实测） | `stream-x-asr-160ms-zh-en-punct-int8` | 230MB |
-| whisper（small-q5_1 + VAD） | 说完一整句才出字 | 0.3s（GPU）/ 1.4s（CPU） | `ggml-small-q5_1.bin` | 190MB + 服务端 |
+| 引擎 | 跑在哪 | 出字时机 | 首字延迟 | 模型 | 装完占磁盘 |
+|---|---|---|---|---|---|
+| **X-ASR**（`stream-x-asr-160ms-zh-en-punct-int8`） | **本进程内**，sherpa-onnx 直接调模型，不监听端口 | 说的时候逐字出，停约 1 秒定稿 | 约 0.4s（实测） | int8 量化，中英双语 + 标点 | 134MB |
+| **whisper**（`ggml-small-q5_1.bin` + VAD） | 独立子进程 `whisper-server`，走 HTTP | 说完一整句才出字 | 0.3s（GPU）/ 1.4s（CPU） | small-q5_1 | 190MB + 服务端 |
 
-设置面板 →「语音输入 → 流式识别」：装好模型后引擎选「自动」即可，没装自动退回 whisper，
-用户不需要理解两套引擎的区别。
+设置面板 →「语音输入 → 识别引擎」三选一，**指定谁就先用谁，指定的那个不可用时自动换另一个兜底**：
 
-**定稿后再纠错**（+228MB，**默认关闭，暂不推荐**）：每句说完，用 SenseVoice-Small 把整句
-音频重听一遍，用它的结果替换流式草稿。说话过程完全不受影响（跑的仍是流式），只在「一句话
-结束」那一刻多花约 250ms（6 秒音频，RTF 0.034）。代码在 `core/src/finalize_stt.rs`，开关是
-`settings.sttCorrect`，模型没装时开关置灰并提示下载。
+| 选项 | 行为 |
+|---|---|
+| 自动 | 装了什么用什么：X-ASR 装了就走它，没装走 whisper |
+| X-ASR | 优先 X-ASR；模型不在或加载失败 → 改用 whisper，并在输入框上方提示一句 |
+| whisper | 优先 whisper-server；服务/模型没装 → 改用 X-ASR，同样有提示 |
 
-> **实测结论：中文短句上是净损失。** 8 句日常口吻样本（登录页/接口/部署/空指针/连接池），
-> 流式 X-ASR **0.00% CER**，SenseVoice **1.36%**——唯一错的那句是「连接池」听成「连接尺」，
-> 只改一个字、差异率 6%，任何阈值都拦不住。所以默认保持关闭；它的潜在价值只在英文术语
-> （`Tauri`、`vLLM` 这类两个模型都会错），且未验证。
+**只有 whisper 需要「服务地址 + 端口」**：它靠 HTTP 收音频，所以设置里有端口和地址两项。
+X-ASR 在进程内推理，**不占端口、不需要地址**，那两项设置对它完全无效（界面上已标注）。
 
-#### 流式识别的实现要点
+#### X-ASR 流式识别的实现要点
 
 - 引擎在 `core/src/stream_stt.rs`：sherpa-onnx 的 `OnlineRecognizer`，进程内常驻，
   一个会话一个 stream。音频 100ms 一块从 `pcm-recorder.ts` 的 `onFrame` 流出，
@@ -142,26 +140,8 @@ pnpm stt            # 起本地语音识别服务（127.0.0.1:28080，见下节�
   套在半句话上会把正文一起清掉
 - 实测 RTF **0.19–0.24**（4 线程），20 秒长音频不退化；线程数上限卡在 4
   ——实测 8 线程反而降到 0.354，内存带宽先饱和
-
-#### 定稿纠错的实现要点
-
-- 引擎在 `core/src/finalize_stt.rs`：sherpa-onnx 的 `OfflineRecognizer`（SenseVoice-Small），
-  非流式，一次吃一整句
-- **音频要在流式引擎里攒着**：`Session::utter` 保存当前句的 f32 采样，endpoint 或 `finish()`
-  时一次取走（`mem::take`）交给 SenseVoice。一句最长 15 秒，不到 1MB
-- **必须开 `use_itn`**：标点恢复和数字规范化是同一个开关。关掉之后标点会全部消失，
-  开了才会把「三点」写成「3点」——标点更重要，所以取 `true`
-- 纠错失败（模型没装、推理报错、返回空）一律**退回流式文本**，绝不因为纠错让一句话消失
-- **三条保守规则**（`core/src/stream_stt.rs` 的 `correct_text`）：这是「越纠越错」的补丁。
-  SenseVoice 偶尔会把整句听成另一句话（短句、口音、英文术语时最容易），此时它一定比
-  已经跑通整句上下文的流式结果差：
-  1. 音频不足 0.8 秒（`MIN_CORRECT_SAMPLES`）不纠——「好的」「嗯」这类应答纠错收益为零、
-     风险最大
-  2. 改动超过 3 个字**且**差异率超过 40%（`MAX_EDIT_CHARS` / `MAX_EDIT_RATIO`）判为
-     「听岔了」，保留流式文本。差异只算内容字，标点差异不计
-  3. 每次定稿都把「流式原文 → 纠错后」+ 改动字数/比例写进 `~/.shania/logs/shania.log`
-     （搜「定稿纠错」），出问题能直接对账
-- 模型在启动后 2 秒由 `preload` 异步预热（1.6 秒），否则第一句定稿会明显卡一下
+- **IPC 三个命令**（`stt_stream_start` / `feed` / `stop`），数据全程走 Tauri IPC，
+  不开 HTTP 端口——这也是它不需要「服务地址」的原因
 
 #### 发版前必须处理：DLL 分发（重要）
 
@@ -181,7 +161,7 @@ DLL 内部已经把 STL 静态链好了，我们只调 C API，所以不受本�
 1. **推荐**：把 VS 2022 更新到 17.10+（MSVC 14.44），改回 `static`，回到单 exe 分发
 2. 留在 `shared`：用 NSIS `installerHooks` 把 4 个 DLL 装到 `$INSTDIR` 根目录
 
-whisper 那条路的设置面板 →「语音输入 → 本地服务」：
+whisper 那一半的设置面板 →「语音输入 → whisper 本地服务」：
 
 | 状态 | 含义 |
 |---|---|
@@ -189,21 +169,21 @@ whisper 那条路的设置面板 →「语音输入 → 本地服务」：
 | 已安装，用到时自动启动 | 文件齐了，但「启动时预加载」被关掉，点麦克风时才拉起进程 |
 | 就绪（端口 xxxxx，CPU/GPU） | 进程在跑，端口默认 28080，被占时自动顺延 |
 
-五个可调字段 + 两个开关：
+字段说明（**这一组全部只对 whisper 生效**，X-ASR 不看它们）：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| 启动时预加载 | **开** | 打开程序就在后台加载模型（约 2–3 秒、常驻约 380MB），点麦克风立刻可用；关掉则退化为用到才起 |
+| 启动时预加载 | **开** | 只预热当前指定的引擎：引擎是 X-ASR 时读模型进内存（约 500MB），是 whisper 时拉起进程（约 380MB）；关掉则都退化为用到才起 |
 | 推理后端 | `cpu` | `cpu` 开箱即用；`cuda` 走 NVIDIA 显卡，**额外下载约 650MB**，实测快 3–8 倍。没有 NVIDIA 显卡时该选项禁用 |
-| 服务端口 | `28080` | 本地服务的首选端口，被占时自动往后找；填 `0` 表示每次随机 |
-| 识别服务地址 | 留空 | **留空 = 用内置本地服务**；要接远程或自管服务才填，填到 `/v1` 为止 |
-| 识别模型 | `whisper-1` | 本地 whisper-server 忽略它（模型由启动参数决定） |
-| 语言提示 | `zh` | 留空由服务端判断；中文短句建议显式填 `zh` |
+| 服务端口 | `28080` | whisper 进程的监听端口，被占时自动往后找；填 `0` 表示每次随机 |
+| 识别服务地址 | 留空 | **留空 = 用内置本地 whisper 服务**；要接远程或自管服务才填，填到 `/v1` 为止。填了就不再检查本地是否安装 |
+| 识别模型 | `whisper-1` | 本地 whisper-server 忽略它（模型由启动参数决定）；接云端 OpenAI 才需要 |
+| 语言提示 | `zh` | 只对 whisper 生效，留空由服务端判断；X-ASR 是中英双语固定模型，不看这一项 |
 
 行为要点：
 
 - **实时分句转写**（`src/lib/pcm-recorder.ts`）：AudioWorklet 直接采 16k PCM，用能量 VAD 判断「这句说完了」（静音 450ms），一句结束立刻发一次转写并插入文字。用户还在说第二句时，第一句的字已经出来了。单句超过 8 秒强制切开，避免服务端上下文装不下
-- **不是真流式**：whisper-server 只收完整音频文件，「实时」是前端切句 + 串行队列模拟的，没有 token 级输出
+- **不是真流式**：whisper-server 只收完整音频文件，「实时」是前端切句 + 串行队列模拟的，没有 token 级输出。真流式在 X-ASR 那条路
 - **CPU 上用 `-ac 450`**：whisper 默认把音频补零到 30 秒再编码（4 秒的话也按 30 秒算），把上下文缩到 9 秒实测 4.4s → 1.8s。GPU 版不加（本来就 0.3 秒，不值得冒截断风险）
 - **启动即预热**：`lib.rs` 的 setup 里调 `stt::preload()`，后台异步拉起，不阻塞窗口显示；没装则安静跳过，失败只打日志，不影响后续按需启动
 - 进程**起一次常驻、应用退出时杀**（`src-tauri/src/stt.rs`）；端口优先用设置的 28080，冲突则顺延 20 个，仍不行才交给系统随机
@@ -217,20 +197,18 @@ whisper 那条路的设置面板 →「语音输入 → 本地服务」：
 安装位置（都在 `~/.shania/` 下，与配置、会话同源）：
 
 ```
-~/.shania/models/stream-x-asr-160ms-zh-en-punct-int8/    # 流式模型，230MB（encoder.int8/decoder/joiner/tokens）
-~/.shania/models/sense-voice-zh-en-ja-ko-yue-2024-07-17/ # 纠错模型，228MB（model.int8.onnx + tokens.txt）
-~/.shania/tools/whisper/Release/whisper-server.exe        # CPU 版，b5454 官方预编译包（8.6MB）
-~/.shania/tools/whisper-cuda/Release/whisper-server.exe   # GPU 版，自带 cudart/cublas，不必装 CUDA Toolkit（1.2GB）
+~/.shania/models/stream-x-asr-160ms-zh-en-punct-int8/    # X-ASR 模型，解压后约 230MB（encoder.int8/decoder/joiner/tokens）
+~/.shania/tools/whisper/Release/whisper-server.exe        # whisper CPU 版，b5454 官方预编译包（8.6MB）
+~/.shania/tools/whisper-cuda/Release/whisper-server.exe   # whisper GPU 版，自带 cudart/cublas，不必装 CUDA Toolkit（1.2GB）
 ~/.shania/models/ggml-small-q5_1.bin                      # 182 MB，中文可用，两个后端共用
 ~/.shania/tools/ffmpeg/bin/ffmpeg.exe                     # 可选，只有回退 webm 时才需要
 ```
 
-下载地址可用环境变量指向镜像（默认走 GitHub release，国内可能很慢）：
-`SHANIA_STREAM_STT_URL`（流式模型）、`SHANIA_SENSE_STT_URL`（纠错模型）。
+下载地址可用环境变量指向镜像（默认走 GitHub release，国内可能很慢）：`SHANIA_STREAM_STT_URL`。
 
-**纠错模型只认 int8。** 上游同时提供 `-int8-` 专用包（155MB）和把 fp32 + int8 都塞进去的
-999MB 包。实测两者输出逐字相同、int8 还快 20-40%，所以代码里只挑 `*.int8.onnx`
-（`finalize_stt::files`），下载地址也固定指向 int8 包——别为了「可能更准」去下那个 1GB 的。
+> 历史包袱：早期版本曾接过 SenseVoice-Small 做「定稿后再纠错」，实测中文净损失
+> （8 句样本 CER 1.36% vs 流式 0.00%），代码已整体删除。如果 `~/.shania/models/sense-voice-*`
+> 还在，可以手动删掉，当前程序不会再用它。
 
 #### 实测延迟（i7-11800H / RTX 3050 Laptop 4GB / small-q5_1）
 
@@ -402,7 +380,9 @@ src-tauri/core/src/          ← Agent 核心，改这里会同时影响桌面�
   chat.rs         run_chat / run_agent_loop / consume_stream / test_connection / CancelRegistry
   tools.rs        内置工具定义与执行（4 个：时间/系统信息/读文件/列目录）+ is_builtin
   mcp.rs          MCP 客户端：stdio 启动 server、initialize / tools/list / tools/call
-  transcribe.rs   语音识别：multipart 转发到 OpenAI 兼容 /audio/transcriptions
+  transcribe.rs   whisper 引擎的客户端：multipart 转发到 OpenAI 兼容 /audio/transcriptions
+  stream_stt.rs   X-ASR 引擎：sherpa-onnx OnlineRecognizer，进程内推理（feature `stream-stt`）
+  stt_setup.rs    两个引擎共用的下载/解压/端口探测
   events.rs       StreamEvent + EventSink trait
 
 src-tauri/cli/src/
@@ -417,7 +397,9 @@ src-tauri/src/               ← 桌面端命令层，Agent 逻辑一律不在�
   storage.rs      ~/.shania/sessions/<id>.json 按会话分文件读写（含聚合文件拆分迁移）
   settings.rs     ~/.shania/settings.json 原子读写（与 CLI 共用的设置文件）
   export.rs       导出落盘（write_text_file）/ 导入读取（read_import_file）
-  audio.rs        语音识别命令，转发 core::transcribe
+  audio.rs        whisper 转写命令，转发 core::transcribe（X-ASR 的命令在 stt_stream.rs）
+  stt.rs          whisper 进程管理：安装、拉起、端口复用、退出时杀掉
+  stt_stream.rs   X-ASR 命令层：start / feed / stop / install / unload
 
 src/
   lib/types.ts        ← StreamEvent 联合类型、Message/Attachment/WireMessage/AppSettings

@@ -2,17 +2,19 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// 语音识别（STT）接入参数。
-/// 走 OpenAI 兼容的 `/audio/transcriptions`，所以 whisper.cpp、faster-whisper、
-/// FunASR 的 OpenAI 兼容网关、以及云端 OpenAI 都能直接用。
+/// 语音识别（STT）接入参数——**HTTP 那套引擎用**（本地 whisper-server，或任何
+/// OpenAI 兼容的 `/audio/transcriptions` 服务：faster-whisper、FunASR 网关、云端 OpenAI）。
+///
+/// 另一套引擎 X-ASR 在 `stream_stt.rs`，进程内推理、不走 HTTP，也就不需要这里的
+/// base_url / model / api_key。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SttConfig {
-    /// 服务根地址，例如 http://127.0.0.1:8000/v1
+    /// 服务根地址，例如 http://127.0.0.1:28080/v1
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
-    /// 模型名，如 whisper-1 / whisper-large-v3 / SenseVoiceSmall
+    /// 模型名，如 whisper-1 / whisper-large-v3（本地 whisper-server 忽略它）
     #[serde(default = "default_model")]
     pub model: String,
     /// 口音提示，如 zh / en；留空由服务端自动判断

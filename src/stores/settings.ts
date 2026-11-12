@@ -25,7 +25,7 @@ const DEFAULTS: AppSettings = {
   autoStart: false,
   contextLimit: 32000,
   sttModel: 'whisper-1',
-  // 留空 = 用程序自己拉起的本地服务；接远程服务时才填
+  // whisper 引擎专用：留空 = 用程序自己拉起的本地 whisper-server；接远程服务时才填
   sttBaseUrl: '',
   sttPort: 28080,
   sttPreload: true,
@@ -33,10 +33,9 @@ const DEFAULTS: AppSettings = {
   // 可以在设置里换成 cuda（额外 650MB，快好几倍）
   sttBackend: 'cpu' as 'cpu' | 'cuda',
   sttLanguage: 'zh',
-  // auto：流式模型装了就走流式，没装悄悄退回 whisper——用户不用理解两套引擎的区别
+  // auto：X-ASR 装了就走它，没装走 whisper——用户不用理解两套引擎的区别。
+  // 手动指定某一套时，它不可用会自动换另一套兜底。
   sttEngine: 'auto' as 'auto' | 'stream' | 'whisper',
-  // 纠错层还没接，先占位。打开不会有行为差异，等 SenseVoice 上线再生效。
-  sttCorrect: false,
   profiles: [],
   activeProfileId: '',
 }

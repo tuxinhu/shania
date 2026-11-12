@@ -1,4 +1,12 @@
-//! 本地语音服务的进程管理与安装入口。
+//! whisper 引擎的进程管理与安装入口（whisper.cpp 的 `whisper-server`）。
+//!
+//! **这条链路才是唯一需要「服务地址 + 端口」的那个**：它在独立子进程里跑 HTTP 服务，
+//! 前端（`lib/api.ts::transcribeAudio`）按 OpenAI 兼容的 `/audio/transcriptions`
+//! 把整段音频 POST 过去。另一条引擎 X-ASR（`stream_stt.rs`）在进程内推理，
+//! 不监听任何端口，所以「服务端口」「识别服务地址」这两项设置对它无效。
+//!
+//! 两套引擎由 `settings.sttEngine` 指定：指定的那个先试，起不来就换另一个兜底
+//! （`auto` 表示「X-ASR 装了就用它」）。这里只负责 whisper 这一半能力。
 //!
 //! 生命周期很简单：**用到才起、起一次常驻、退出时杀**。
 //! 模型加载要一两秒，每次转写都重启会让「说完等半天」雪上加霜，所以进程复用。
@@ -128,17 +136,13 @@ pub struct SttStatus {
     gpu_available: bool,
     /// GPU 版二进制装好没有
     cuda_ready: bool,
-    /// 流式识别模型装好没有。装好了前端就走流式（边说边出字），
-    /// 没装就退回 whisper 那条「说完才出字」的老路。
+    /// X-ASR 流式模型装好没有（进程内推理，不需要端口）。
+    /// 装好了才有资格当「主引擎」；没装就只能靠 whisper。
     stream_ready: bool,
-    /// 流式模型占用多少磁盘
+    /// X-ASR 模型占用多少磁盘
     stream_bytes: u64,
-    /// 识别器是否已经加载进内存（第一次录音后才为 true）
+    /// X-ASR 识别器是否已经加载进内存（第一次录音或预加载后为 true）
     stream_loaded: bool,
-    /// 定稿纠错模型（SenseVoice）装好没有。没装时「定稿后再纠错」开关不生效。
-    correct_ready: bool,
-    /// 纠错模型占用多少磁盘
-    correct_bytes: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -185,7 +189,7 @@ pub fn stt_status(
 ) -> Result<SttStatus, String> {
     let root = root_dir()?;
     let (_, _, backend) = startup_prefs();
-    let (stream_ready, stream_bytes, stream_loaded, correct_ready, correct_bytes) =
+    let (stream_ready, stream_bytes, stream_loaded) =
         crate::stt_stream::status_bits(&root, &stream);
     Ok(SttStatus {
         server_ready: stt_setup::server_ready_for(&root, backend),
@@ -210,8 +214,6 @@ pub fn stt_status(
         stream_ready,
         stream_bytes,
         stream_loaded,
-        correct_ready,
-        correct_bytes,
     })
 }
 
@@ -343,18 +345,33 @@ pub async fn stt_ensure(
 
 /// 启动时预热：模型加载要几秒（机械盘上十几秒），等用户点麦克风才起就太慢了。
 ///
-/// 只在设置里的「启动时预加载」开着、且服务端和模型都装好时才动手；
-/// 没装就安静跳过，不打扰用户。失败只打日志——预热失败不该影响程序可用性，
-/// 用户点麦克风时还会再试一次。
+/// 只在设置的「启动时预加载」开着时才动手，没装就安静跳过，不打扰用户。
+/// 失败只打日志——预热失败不该影响程序可用性，用户点麦克风时还会再试一次。
+///
+/// **只预热这次真正会用到的那个引擎**：X-ASR 约 500MB、whisper 约 380MB，
+/// 两边都读一遍纯属浪费。引擎按 `settings.sttEngine` 取：
+///   * `stream`  → 只读 X-ASR 模型（whisper 只作兜底，真要兜底时再起进程）
+///   * `whisper` → 只拉 whisper 进程
+///   * `auto`    → X-ASR 装了就只读它，没装才拉 whisper
 pub fn preload(app: &AppHandle) {
     let (enabled, port, backend) = startup_prefs();
     if !enabled {
         return;
     }
 
-    // 流式模型也一并读进内存。它才是「点麦克风立刻有字」依赖的那一份，
-    // 而 whisper 服务只在引擎被强制成 whisper、或者流式没装时才用得上。
-    crate::stt_stream::preload(app);
+    let engine = engine_pref();
+    if engine != "whisper" {
+        crate::stt_stream::preload(app);
+    }
+
+    // auto 且 X-ASR 已经在盘上：这会儿点麦克风就会走流式，whisper 只在它起不来时
+    // 才会被用到，没必要让它先占着 380MB
+    let stream_on_disk = root_dir()
+        .map(|root| shania_core::stream_stt::ready(&root))
+        .unwrap_or(false);
+    if engine != "whisper" && stream_on_disk {
+        return;
+    }
 
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -364,9 +381,29 @@ pub fn preload(app: &AppHandle) {
             Ok(_) => {}
             // 没装是最常见的情况，不算错误
             Err(err) if err == NOT_INSTALLED => {}
-            Err(err) => shania_core::log_error!("语音服务预加载失败：{err}"),
+            Err(err) => shania_core::log_error!("whisper 服务预加载失败：{err}"),
         }
     });
+}
+
+/// 设置里指定的识别引擎：`auto` / `stream`（X-ASR）/ `whisper`。
+///
+/// 缺字段或拼错一律当 `auto`——老版本设置文件里没有这一项，而 auto 的行为
+/// 就是「装了 X-ASR 就用它，否则 whisper」，和以前的默认表现一致。
+fn engine_pref() -> String {
+    let raw = crate::settings::load_settings()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| {
+            v.get("sttEngine")
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "auto".to_string())
 }
 
 /// 从设置文件里读「是否预加载」「首选端口」「用哪个后端」。

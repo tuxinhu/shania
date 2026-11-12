@@ -89,8 +89,10 @@ export interface SttConfigPayload {
 }
 
 /**
- * 录音转文字。音频以 base64 传给 Rust，由它转发到 /audio/transcriptions。
- * 走 Rust 是为了绕开 WebView 的 CORS，同时不把 apiKey 暴露给页面脚本。
+ * whisper 引擎的整段转写：音频以 base64 传给 Rust，由它转发到 `/audio/transcriptions`。
+ *
+ * 只走 whisper 那条路（X-ASR 用 `lib/stream-stt.ts` 的 IPC 链路，根本不发 HTTP）。
+ * 放在 Rust 侧转发是为了绕开 WebView 的 CORS，同时不把 apiKey 暴露给页面脚本。
  */
 export async function transcribeAudio(
   audioBase64: string,
@@ -101,6 +103,14 @@ export async function transcribeAudio(
   return invoke<string>('transcribe_audio', { audioBase64, mime, config })
 }
 
+/**
+ * 两条语音引擎的安装/运行状态。
+ *
+ * 前半段（serverReady / modelReady / running / port / vadReady …）描述的是
+ * **whisper 引擎**：独立子进程 whisper-server，走 HTTP，所以有端口；
+ * 后半段（streamReady / streamBytes / streamLoaded）描述 **X-ASR 引擎**：
+ * 进程内推理，不占端口，也不需要服务地址。
+ */
 export interface SttStatus {
   serverReady: boolean
   modelReady: boolean
@@ -121,25 +131,18 @@ export interface SttStatus {
   /** GPU 版二进制是否已装好 */
   cudaReady: boolean
   /**
-   * 流式识别模型（X-ASR，约 134MB）装好没有。
-   * 装好了语音输入就走流式：边说边出字，说完约 1 秒内定稿。
+   * X-ASR 流式模型（约 134MB）装好没有。装好了才可能用流式引擎：
+   * 边说边出字，说完约 1 秒内定稿。
    */
   streamReady: boolean
-  /** 流式模型占用多少磁盘 */
+  /** X-ASR 模型占用多少磁盘 */
   streamBytes: number
-  /** 识别器是否已加载进内存（第一次录音后才为 true） */
+  /** X-ASR 识别器是否已加载进内存（预加载或第一次录音后为 true） */
   streamLoaded: boolean
-  /**
-   * 定稿纠错模型（SenseVoice，约 228MB）装好没有。
-   * 装好了才能开「定稿后再纠错」：每句说完，用另一个模型把整句重听一遍。
-   */
-  correctReady: boolean
-  /** 纠错模型占用多少磁盘 */
-  correctBytes: number
 }
 
 export interface SttProgress {
-  stage: 'server' | 'model' | 'vad' | 'stream' | 'correct' | 'done'
+  stage: 'server' | 'model' | 'vad' | 'stream' | 'done'
   done: number
   total: number | null
 }
@@ -167,19 +170,13 @@ export async function sttStop(): Promise<void> {
   await invoke('stt_stop')
 }
 
-/** 下载流式识别模型（约 134MB），进度同样走 stt-progress，stage 为 stream */
+/** 下载 X-ASR 流式模型（约 134MB），进度同样走 stt-progress，stage 为 stream */
 export async function sttStreamInstall(): Promise<void> {
   if (!isTauri) throw new Error('浏览器预览环境不支持安装语音模型')
   await invoke('stt_stream_install')
 }
 
-/** 下载定稿纠错模型（int8 包 155MB，解压后 228MB），stage 为 correct */
-export async function sttCorrectInstall(): Promise<void> {
-  if (!isTauri) throw new Error('浏览器预览环境不支持安装语音模型')
-  await invoke('stt_correct_install')
-}
-
-/** 卸载识别器释放内存（下次录音会重新加载） */
+/** 卸载 X-ASR 识别器释放内存（下次录音会重新加载） */
 export async function sttStreamUnload(): Promise<void> {
   if (!isTauri) return
   await invoke('stt_stream_unload')

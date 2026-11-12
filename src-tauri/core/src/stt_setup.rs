@@ -1,4 +1,8 @@
-//! 本地语音服务（whisper.cpp 的 whisper-server）的安装辅助。
+//! whisper 引擎（whisper.cpp 的 whisper-server）的安装辅助。
+//!
+//! 只管 HTTP 那套引擎：下载预编译包、下载 ggml 模型、等端口就绪。
+//! X-ASR 那套的资源（`.tar.bz2` 解压、模型目录、镜像 URL）在 `stream_stt.rs`；
+//! 两边共用的只有本文件里的 `download`。
 //!
 //! 分发时安装包不带 190MB 的模型，也不强制用户自己编译：这里负责把官方
 //! Windows 预编译包和模型下载到 `~/.shania` 下，之后由桌面端自己拉起进程。

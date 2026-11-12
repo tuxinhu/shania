@@ -386,7 +386,6 @@ pub fn run() {
             stt_stream::stt_stream_feed,
             stt_stream::stt_stream_stop,
             stt_stream::stt_stream_install,
-            stt_stream::stt_correct_install,
             stt_stream::stt_stream_unload,
             set_global_shortcut,
             set_close_action,
@@ -419,8 +418,8 @@ pub fn run() {
             }
             register_global_shortcut(handle);
 
-            // 语音服务在后台预热（模型加载要几秒），不阻塞窗口显示。
-            // 设置里关掉「启动时预加载」就退回按需启动。
+            // 语音引擎在后台预热（模型加载要几秒），不阻塞窗口显示。
+            // 只预热设置里指定的那个引擎；关掉「启动时预加载」就退回按需加载。
             stt::preload(handle);
 
             // 首启带参数时前端还没加载，先存着，等它挂载后主动来取。

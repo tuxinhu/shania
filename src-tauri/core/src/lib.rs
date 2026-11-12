@@ -7,17 +7,18 @@
 
 pub mod chat;
 pub mod events;
-/// 定稿纠错（SenseVoice 整句重听）。和 `stream_stt` 一样挂在同一个 feature 下：
-/// 它俩共用一份 sherpa-onnx 运行时，拆开没有意义。
-#[cfg(feature = "stream-stt")]
-pub mod finalize_stt;
 pub mod logging;
 pub mod mcp;
 pub mod simplify;
 mod simplify_table;
 pub mod stt_setup;
-/// 流式识别。用 feature 隔开是因为它把 sherpa-onnx 和 onnxruntime 静态链接进来
+/// 流式识别（X-ASR 160ms，sherpa-onnx `OnlineRecognizer`，进程内推理）。
+///
+/// 用 feature 隔开是因为它会把 sherpa-onnx 和 onnxruntime 一起链进来
 /// （命令行二进制会从几 MB 涨到几十 MB），而 CLI 根本用不到语音输入。
+///
+/// 这是和 [`transcribe`]（whisper-server，走 HTTP）并列的另一条引擎，两者由
+/// `settings.sttEngine` 指定用谁、另一个自动兜底——见 `stream_stt` 的模块注释。
 #[cfg(feature = "stream-stt")]
 pub mod stream_stt;
 pub mod tools;

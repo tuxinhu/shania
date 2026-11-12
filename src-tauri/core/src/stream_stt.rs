@@ -1,16 +1,22 @@
-//! 流式语音识别：sherpa-onnx 的 `OnlineRecognizer`。
+//! 流式语音识别：X-ASR 160ms 模型，走 sherpa-onnx 的 `OnlineRecognizer`，**进程内**推理。
 //!
 //! 和 [`crate::transcribe`] 那条路（whisper-server，一次一整段）本质区别是**什么时候出结果**：
 //!
-//! | | whisper（`transcribe.rs`） | 这里 |
+//! | | X-ASR（这里） | whisper（`transcribe.rs`） |
 //! |---|---|---|
-//! | 出字 | 说完一句才开始编码 | 每 160ms 一块，边说边出 |
-//! | 首字延迟 | 0.3s（GPU）～1.4s（CPU `-ac 450`） | 约 200ms |
-//! | 标点 | 靠前端补（`lib/punctuate.ts`） | 模型自带标点 token |
-//! | 幻觉 | 静音/提示音会编字幕，要 VAD + 文本清洗两头堵 | 实测静音/白噪声/提示音全空 |
+//! | 跑在哪 | 进程内，sherpa-onnx 直接调模型 | 独立子进程 `whisper-server`，走 HTTP |
+//! | 出字 | 每 160ms 一块，边说边出 | 说完一句才开始编码 |
+//! | 首字延迟 | 约 400ms（实测） | 0.3s（GPU）～1.4s（CPU `-ac 450`） |
+//! | 标点 | 模型自带标点 token | 靠前端补（`lib/punctuate.ts`） |
+//! | 幻觉 | 实测静音/白噪声/提示音全空 | 静音/提示音会编字幕，要 VAD + 文本清洗两头堵 |
+//! | 需要地址/端口 | **不需要**，不监听任何端口 | 需要（默认 28080，可另填远程地址） |
 //!
 //! 所以这里不做能量切句、不做 partial 重解码：一个 session 一个 stream，音频进来就喂，
 //! endpoint 判定交给模型自己（`rule1/rule2/rule3`），断了就 reset 开始下一句。
+//!
+//! 两套引擎地位对等，**没有谁是谁的升级版**：`settings.sttEngine` 指定用哪个就先试哪个，
+//! 指定的这个不可用时自动换另一个兜底（`auto` 则是「X-ASR 装了就用它」）。判断依据：
+//! 这边只看模型文件是否齐全（[`ready`]），whisper 那边看服务端 + 模型是否装好。
 //!
 //! 模型是 X-ASR 160ms 的 int8 量化包（134MB），解压后四个文件。刻意用「按文件名前缀扫目录」
 //! 而不是写死 `encoder-epoch-99-avg-1.int8.onnx`：换个模型版本就得改代码，扫一遍更省事。
@@ -172,13 +178,6 @@ pub struct Feed {
 struct Session {
     recognizer: OnlineRecognizer,
     stream: OnlineStream,
-    /// 模型目录。定稿纠错要拿它去读 SenseVoice 的路径，存在 session 里省得每次传。
-    root: PathBuf,
-    /// 每句定稿后是否用 SenseVoice 重听一遍。模型没装好时这里恒为 false。
-    correct: bool,
-    /// 这一句到目前为止的音频。定稿纠错必须整句重听，所以得留着；一句最长
-    /// 15 秒（`MAX_UTTERANCE_MS`），240k 个 f32 不到 1MB，直接堆内存里没有负担。
-    utter: Vec<f32>,
     /// 这句已经说多久了，超过 `MAX_UTTERANCE_MS` 强制断——model 的 rule3 也是
     /// 干这个的，但它是按解码帧算的，我们这边再兜一层，免得一口气念稿子时
     /// partial 无限长、前端每次都要重绘一大段。
@@ -215,23 +214,14 @@ impl Engine {
     }
 
     /// 创建识别器 + 一个新 stream。已经加载过就直接重置，不再读盘。
-    ///
-    /// `correct` 是「每句定稿后是否跑 SenseVoice 重听」。模型没装好时会被静默降级成
-    /// false——纠错是可选增强，不能因为它让整个语音输入不可用。
-    pub fn start(&self, root: &Path, correct: bool) -> Result<(), String> {
+    pub fn start(&self, root: &Path) -> Result<(), String> {
         let mut guard = self.inner.lock().map_err(|_| "识别器状态锁失效".to_string())?;
-
-        // 每次开始都重新算一遍：用户可能刚在设置里拨了开关、或者刚下完模型
-        let correct = correct && crate::finalize_stt::ready(root);
 
         if let Some(session) = guard.as_mut() {
             // 复用：把上一轮没说完的残句清掉，换个干净的 stream 状态
             session.recognizer.reset(&session.stream);
             session.last_partial.clear();
             session.utterance_ms = 0;
-            session.utter.clear();
-            session.correct = correct;
-            session.root = root.to_path_buf();
             return Ok(());
         }
 
@@ -278,16 +268,10 @@ impl Engine {
             thread_count(),
             dir(root).display()
         );
-        if correct {
-            crate::log_info!("定稿纠错已启用：{}", crate::finalize_stt::dir(root).display());
-        }
 
         *guard = Some(Session {
             recognizer,
             stream,
-            root: root.to_path_buf(),
-            correct,
-            utter: Vec::new(),
             utterance_ms: 0,
             last_partial: String::new(),
         });
@@ -314,8 +298,6 @@ impl Engine {
             session.recognizer.decode(&session.stream);
         }
         session.utterance_ms += (samples.len() as u32 * 1000) / 16_000;
-        // 定稿纠错要整句重听，先把这块攒起来；断句时一次取走并清空
-        session.utter.extend_from_slice(samples);
 
         let text = session
             .recognizer
@@ -327,17 +309,12 @@ impl Engine {
             || session.utterance_ms >= MAX_UTTERANCE_MS;
 
         if ended {
-            let audio = std::mem::take(&mut session.utter);
-            let mut finals = Vec::new();
-            if !text.is_empty() {
-                finals.push(correct_text(session, &audio, text));
-            }
             session.recognizer.reset(&session.stream);
             session.utterance_ms = 0;
             session.last_partial.clear();
             return Ok(Feed {
                 partial: String::new(),
-                finals,
+                finals: if text.is_empty() { Vec::new() } else { vec![text] },
             });
         }
 
@@ -378,17 +355,9 @@ impl Engine {
             .map(|r| clean(&r.text))
             .unwrap_or_default();
 
-        // 取音频要在判断空文本之前：这一句哪怕流式没解出字，音频也已经攒着了
-        let audio = std::mem::take(&mut session.utter);
         session.recognizer.reset(&session.stream);
         session.utterance_ms = 0;
         session.last_partial.clear();
-
-        let text = if text.is_empty() {
-            text
-        } else {
-            correct_text(session, &audio, text)
-        };
 
         Ok(Feed {
             partial: String::new(),
@@ -402,120 +371,6 @@ impl Engine {
             *guard = None;
         }
     }
-}
-
-/// 纠错结果和流式文本的最大差异率。
-///
-/// 这个功能的定位是「改几个同音字」，不是「重写一句话」。实测里 SenseVoice 偶尔会把
-/// 整句听成另一句话——短句上下文少、英文术语、口音重的时候最容易出现。那种情况下
-/// 它一定比已经跑通整句上下文的流式结果差，**保留流式文本**才是对的。
-const MAX_EDIT_RATIO: f32 = 0.4;
-
-/// 差异的绝对值上限：只要改动不超过这么多字，就算差异率偏高也接受。
-///
-/// 差异率是按句长归一化的，「你好啊」这种 3 字短句改一个字就是 33%，光看比例会误判。
-const MAX_EDIT_CHARS: usize = 3;
-
-/// 太短的音频不做纠错。
-///
-/// 0.8 秒以内基本是「好的」「嗯」「继续」这类应答：重听一次的收益接近于零，而
-/// SenseVoice 在这种极短音频上最容易跑偏（上下文不足），换错一句话的代价却很实在。
-const MIN_CORRECT_SAMPLES: usize = 12_800; // 0.8s @16k
-
-/// 定稿文本：开了纠错就用 SenseVoice 整句重听的结果替换流式结果。
-///
-/// 任何一步失败（模型没装、推理报错、返回空串）都**退回**流式文本——纠错是锦上添花，
-/// 不能因为它让一整句话消失。失败只记日志，不弹给用户。
-///
-/// 另外三条保守规则，见上面几个常量：太短的音频不纠、差异过大不接受、
-/// 接受时把「流式原文 → 纠错后」一起写进日志，方便对账。
-fn correct_text(session: &Session, audio: &[f32], fallback: String) -> String {
-    if !session.correct || audio.len() < MIN_CORRECT_SAMPLES {
-        return fallback;
-    }
-    let began = std::time::Instant::now();
-    match crate::finalize_stt::finalize(&session.root, audio) {
-        Ok(text) if text.is_empty() => fallback,
-        Ok(text) => {
-            let cost = began.elapsed().as_millis();
-            let (edits, ratio) = diff_stats(&fallback, &text);
-            if edits > MAX_EDIT_CHARS && ratio > MAX_EDIT_RATIO {
-                // 听岔了：两家差得太多，说明 SenseVoice 走了另一条路。留流式的。
-                crate::log_info!(
-                    "定稿纠错差异过大（{} 字/{:.0}%），保留流式文本 {}ms｜流式「{}」→ 纠错「{}」",
-                    edits,
-                    ratio * 100.0,
-                    cost,
-                    fallback,
-                    text
-                );
-                return fallback;
-            }
-            if text != fallback {
-                crate::log_info!(
-                    "定稿纠错 {}ms（改 {} 字/{:.0}%）｜流式「{}」→「{}」",
-                    cost,
-                    edits,
-                    ratio * 100.0,
-                    fallback,
-                    text
-                );
-            }
-            text
-        }
-        Err(err) => {
-            crate::log_warn!("定稿纠错失败，沿用流式文本：{err}");
-            fallback
-        }
-    }
-}
-
-/// 两段文本的字符级差异：返回（改动字数, 差异率 0..1）。
-///
-/// 只比「内容字」，标点和空白先剔掉——否则流式那边多一个「，」就被算成一次改动，
-/// 比例会被无意义地稀释。差异率以两者较长的一条归一化。
-fn diff_stats(a: &str, b: &str) -> (usize, f32) {
-    let left = content_chars(a);
-    let right = content_chars(b);
-    let longest = left.len().max(right.len());
-    if longest == 0 {
-        return (0, 0.0);
-    }
-    let dist = levenshtein(&left, &right);
-    (dist, dist as f32 / longest as f32)
-}
-
-/// 只留内容字：去掉空白和中英标点
-fn content_chars(text: &str) -> Vec<char> {
-    text.chars()
-        .filter(|c| !c.is_whitespace() && !is_punct(*c))
-        .collect()
-}
-
-fn is_punct(c: char) -> bool {
-    c.is_ascii_punctuation()
-        || "，。、！？；：（）【】《》〈〉「」『』“”‘’…—～·".contains(c)
-}
-
-/// 字符级编辑距离，两行滚动数组
-fn levenshtein(a: &[char], b: &[char]) -> usize {
-    if a.is_empty() {
-        return b.len();
-    }
-    if b.is_empty() {
-        return a.len();
-    }
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut curr = vec![0usize; b.len() + 1];
-    for (i, ca) in a.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[b.len()]
 }
 
 /// 模型输出过一遍后处理。
@@ -636,49 +491,6 @@ mod tests {
         assert!(decode_pcm(&b64).is_err());
     }
 
-    /// 只差一个字：典型同音字纠正，必须接受
-    #[test]
-    fn accepts_small_homophone_fix() {
-        let (edits, ratio) = diff_stats("帮我把灯露液的按钮改一下", "帮我把登录页的按钮改一下");
-        assert_eq!(edits, 3); // 灯露液 → 登录页，三个字都换了
-        assert!(ratio < MAX_EDIT_RATIO, "25% 的改动属于纠错范围，实际 {ratio}");
-    }
-
-    /// 整句听成另一句话：必须拒绝（这正是「越纠越错」的那种情况）
-    #[test]
-    fn rejects_full_rewrite() {
-        let (edits, ratio) = diff_stats(
-            "帮我把登录页的按钮改成次要样式",
-            "方我把东陆的按牛改掉四要格式",
-        );
-        assert!(edits > MAX_EDIT_CHARS);
-        assert!(ratio > MAX_EDIT_RATIO, "整句改写应该被判为差异过大，实际 {ratio}");
-    }
-
-    /// 标点差异不算改动——流式少一个逗号不该触发「改写」判断
-    #[test]
-    fn ignores_punctuation_difference() {
-        let (edits, ratio) = diff_stats("你好，你是谁？", "你好你是谁！");
-        assert_eq!(edits, 0);
-        assert_eq!(ratio, 0.0);
-    }
-
-    /// 短句里改两个字：比例很高但绝对改动小，仍然接受
-    #[test]
-    fn short_sentence_single_fix_is_accepted() {
-        let (edits, ratio) = diff_stats("改一下", "该一夏");
-        assert_eq!(edits, 2);
-        assert!(ratio > MAX_EDIT_RATIO, "3 字句改 2 字比例是 67%，应超过阈值");
-        assert!(edits <= MAX_EDIT_CHARS, "但绝对改动只有 2 字，判据要放行");
-    }
-
-    /// 空串不崩，也不被当成「完全一致」
-    #[test]
-    fn empty_strings_do_not_panic() {
-        assert_eq!(diff_stats("", ""), (0, 0.0));
-        assert_eq!(diff_stats("你好", "").1, 1.0);
-    }
-
     /// 读 16k/16bit/单声道 wav（`lib/pcm-recorder.ts` 的 `pcmToWav` 就是这个格式）
     fn read_wav(path: &Path) -> Vec<f32> {
         let bytes = fs::read(path).expect("读不到 wav");
@@ -724,12 +536,8 @@ mod tests {
 
         let engine = Engine::new();
         let began = Instant::now();
-        // 纠错开关从环境变量拿，方便同一个用例分别验「只流式」和「流式 + 定稿纠错」
-        let correct = std::env::var("SHANIA_STREAM_TEST_CORRECT")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        engine.start(&root, correct).expect("加载模型失败");
-        println!("模型加载：{}ms（定稿纠错：{}）", began.elapsed().as_millis(), correct);
+        engine.start(&root).expect("加载模型失败");
+        println!("模型加载：{}ms", began.elapsed().as_millis());
 
         let mut finals: Vec<String> = Vec::new();
         let mut last_partial = String::new();

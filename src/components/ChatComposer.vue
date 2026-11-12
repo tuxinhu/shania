@@ -163,8 +163,22 @@ const recording = ref(false)
 const pendingSegments = ref(0)
 /** VAD 判定当前是否在说话，驱动麦克风的呼吸效果 */
 const speaking = ref(false)
-/** 这一次录音走的是流式（true）还是 whisper 整段（false），决定标题与收尾逻辑 */
+/** 这一次录音走的是 X-ASR 流式（true）还是 whisper 整段（false），决定标题与收尾逻辑 */
 const streamMode = ref(false)
+/**
+ * 一次性提示条：引擎兜底、模型缺失这类「不是错误但用户该知道」的事。
+ *
+ * 兜底是静默进行的会有个副作用——用户改了设置却听不出区别，以为开关坏了。
+ * 所以每次发生兜底都在输入框上方说一句，10 秒后自己消失。
+ */
+const voiceNotice = ref('')
+let noticeTimer: ReturnType<typeof setTimeout> | null = null
+
+function showVoiceNotice(text: string) {
+  voiceNotice.value = text
+  if (noticeTimer) clearTimeout(noticeTimer)
+  noticeTimer = setTimeout(() => (voiceNotice.value = ''), 10_000)
+}
 
 let segmenter: PcmSegmenter | null = null
 /**
@@ -188,11 +202,14 @@ let transcribeQueue: Promise<void> = Promise.resolve()
 let cachedSttBaseUrl = ''
 
 const voiceTitle = computed(() => {
+  const who = streamMode.value ? 'X-ASR' : 'whisper'
   if (recording.value) {
-    return speaking.value ? '正在听…边说边出字（再点结束）' : '聆听中（说话即可）'
+    return speaking.value
+      ? `正在听…${who}（再点结束）`
+      : `聆听中·${who}（说话即可）`
   }
   if (pendingSegments.value > 0) return '正在识别…'
-  return '语音输入（边说边出字）'
+  return '语音输入（用哪套引擎见「设置 → 语音输入」）'
 })
 
 function blobToBase64(blob: Blob): Promise<string> {
@@ -327,25 +344,28 @@ async function streamReadyNow(): Promise<boolean> {
 }
 
 /**
- * 这次录音该不该走流式。
+ * whisper 这次能不能用。
  *
- * 两个前提：设置没强制 whisper、流式模型装好了。
- * 「自动」在模型缺失时静默退回 whisper；「流式」不允许静默——调用方必须先
- * 用 [`streamReadyNow`] 拦一次（见 `toggleVoice`），否则用户改了设置却看不出
- * 任何区别，只会以为开关坏了。
+ * 填了「服务地址」就当作能用——那说明用户把 whisper 指向了别处自己管的服务，
+ * 本地装不装都无所谓；没填才去看本地的服务端 exe 与模型。
  */
-async function streamUsable(): Promise<boolean> {
-  if (settingsStore.settings.sttEngine === 'whisper') return false
-  return streamReadyNow()
+async function whisperUsableNow(): Promise<boolean> {
+  if (settingsStore.settings.sttBaseUrl.trim()) return true
+  try {
+    const status = await sttStatus()
+    return !!status?.serverReady && !!status?.modelReady
+  } catch {
+    return false
+  }
 }
 
 /**
- * 打开流式识别会话。失败返回 false，调用方据此回退到 whisper。
+ * 打开 X-ASR 识别会话。失败返回 false，调用方据此换 whisper。
  *
  * 第一次会加载 134MB 模型（1-2 秒），之后常驻内存，再次 start 是毫秒级。
  */
 async function startStream(): Promise<boolean> {
-  if (!(await streamUsable())) return false
+  if (!(await streamReadyNow())) return false
 
   const session = new StreamStt({
     // 预览是**整句覆盖**：这个模型每次吐的都是从头到现在的结果，不是增量
@@ -489,13 +509,28 @@ async function toggleVoice() {
     voiceStarting = true
     voiceCancelled = false
 
-    // 引擎选了「流式」就是硬要求：模型不在时直接拦住，不静默退回 whisper。
-    // 静默退回的结果是「设置改了但听感一模一样」，用户只会怀疑开关没生效。
-    if (settingsStore.settings.sttEngine === 'stream' && !(await streamReadyNow())) {
+    // 两套引擎地位对等：设置里指定谁就先用谁，指定的那个不可用时换另一个兜底。
+    // 兜底不静默——只说「随意」会把改动藏起来，用户改了设置却听不出区别，
+    // 只会怀疑开关坏了，所以每次兜底都在输入框上方写一句。
+    const engine = settingsStore.settings.sttEngine
+    const streamOk = await streamReadyNow()
+    const whisperOk = await whisperUsableNow()
+
+    let useStream: boolean
+    if (engine === 'stream') useStream = streamOk
+    else if (engine === 'whisper') useStream = !whisperOk && streamOk
+    else useStream = streamOk
+
+    if (!useStream && !whisperOk) {
       recording.value = false
       attachError.value =
-        '流式识别模型还没下载：去「设置 → 语音输入」点「下载流式模型」（约 134MB）'
+        '没有可用的语音引擎：去「设置 → 语音输入」装 X-ASR 模型（约 134MB）或 whisper（约 190MB）'
       return
+    }
+    if (engine === 'stream' && !streamOk) {
+      showVoiceNotice('X-ASR 模型还没下载，这次改用 whisper 识别')
+    } else if (engine === 'whisper' && !whisperOk) {
+      showVoiceNotice('whisper 本地服务或模型没装好，这次改用 X-ASR 流式识别')
     }
 
     // 先把界面切到录音态：start() 里要等麦克风设备打开（200-400ms），
@@ -504,8 +539,11 @@ async function toggleVoice() {
     // 语音文字直接接在原有内容后面，基准要在任何识别结果回来之前定好
     beginVoiceSession()
 
-    // 有流式模型就用流式（边说边出字、说完即定稿），没有就退回 whisper 整段转写
-    const useStream = await startStream()
+    if (useStream) useStream = await startStream()
+    // 模型文件在、但加载失败（文件损坏、缺 DLL）：模型都试过了还失败，只能走 whisper
+    if (!useStream && streamOk && engine !== 'whisper') {
+      showVoiceNotice('X-ASR 启动失败，这次改用 whisper 识别（详情见 ~/.shania/logs/）')
+    }
     streamMode.value = useStream
     // 加载模型这几秒里用户可能已经点了「结束」
     if (voiceCancelled) {
@@ -715,6 +753,7 @@ onUnmounted(() => {
     stream = null
   }
   if (draftTimer) clearTimeout(draftTimer)
+  if (noticeTimer) clearTimeout(noticeTimer)
   document.removeEventListener('click', onDocClick)
 })
 
@@ -730,6 +769,9 @@ defineExpose({ setDraft, focus })
       @dragleave="onDragLeave"
       @drop="onDrop"
     >
+      <p v-if="voiceNotice" class="voice-notice" title="点一下关掉" @click="voiceNotice = ''">
+        {{ voiceNotice }}
+      </p>
       <div v-if="attachments.length || attachError" class="attach-area">
         <div v-for="a in attachments" :key="a.id" class="att" :class="{ doc: a.kind === 'text' }">
           <img v-if="a.kind !== 'text'" :src="a.dataUrl" :alt="a.name" />
@@ -922,6 +964,19 @@ defineExpose({ setDraft, focus })
 .attach-error {
   font-size: 11px;
   color: var(--red);
+}
+
+/* 引擎兜底提示：比错误轻一档，琥珀色，点一下可以关掉 */
+.voice-notice {
+  margin: 0 0 6px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--amber) 30%, transparent);
+  font-size: 11px;
+  line-height: 1.4;
+  color: color-mix(in srgb, var(--amber) 72%, var(--text));
+  cursor: pointer;
 }
 
 .drop-hint {
