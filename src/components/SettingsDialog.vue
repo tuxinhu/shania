@@ -354,6 +354,8 @@ const ttsInstalling = ref('')
 const ttsSwitching = ref(false)
 const ttsTesting = ref(false)
 const ttsError = ref('')
+/** 试听后的自检信息：合成出来的时长/采样率/上下文状态 */
+const ttsDiag = ref('')
 const ttsProgress = ref<{ stage: string; done: number; total: number | null }>({
   stage: '',
   done: 0,
@@ -484,9 +486,17 @@ async function previewVoice(sid?: number) {
   if (ttsTesting.value) return
   ttsTesting.value = true
   ttsError.value = ''
+  ttsDiag.value = ''
 
   // 「重听」按钮不传 sid，用当前选中的编号
   const voice = sid ?? settingsStore.settings.ttsSid
+
+  // 必须在用户手势里建上下文：`new AudioContext()` 建在手势外会被浏览器判成
+  // 自动播放，状态停在 suspended，后面 resume() 也叫不醒——症状就是「点了试听，
+  // 一句合成完成了但完全没声音，也不报错」。所以先建再 await 合成。
+  const ctx = previewCtx ?? new AudioContext()
+  previewCtx = ctx
+  if (ctx.state === 'suspended') await ctx.resume().catch(() => undefined)
 
   try {
     const speech = await ttsSay(
@@ -501,11 +511,11 @@ async function previewVoice(sid?: number) {
     for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
     const pcm = new Int16Array(bytes.buffer, 0, bytes.length >> 1)
     const samples = new Float32Array(pcm.length)
-    for (let i = 0; i < pcm.length; i += 1) samples[i] = pcm[i] / 32768
-
-    const ctx = previewCtx ?? new AudioContext()
-    previewCtx = ctx
-    if (ctx.state === 'suspended') await ctx.resume()
+    let peak = 0
+    for (let i = 0; i < pcm.length; i += 1) {
+      samples[i] = pcm[i] / 32768
+      peak = Math.max(peak, Math.abs(samples[i]))
+    }
 
     const buffer = ctx.createBuffer(1, samples.length, speech.rate)
     buffer.getChannelData(0).set(samples)
@@ -513,6 +523,11 @@ async function previewVoice(sid?: number) {
     source.buffer = buffer
     source.connect(ctx.destination)
     source.start()
+
+    // 一行自检信息：声音不对时不用猜是「没合成出来」还是「没放出来」
+    ttsDiag.value =
+      `${(speech.durationMs / 1000).toFixed(1)}s @${speech.rate}Hz，峰值 ${peak.toFixed(2)}，` +
+      `上下文 ${ctx.state} ${ctx.sampleRate}Hz`
 
     // 模型刚加载完，音色总数这时才拿得到
     await refreshTts()
@@ -971,6 +986,7 @@ onUnmounted(() => {
                       {{ ttsTesting ? '合成中…' : '试听' }}
                     </button>
                   </div>
+                  <p v-if="ttsDiag" class="help">{{ ttsDiag }}</p>
                 </div>
 
                 <div class="field last">

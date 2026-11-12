@@ -23,6 +23,7 @@ const state = ref<CallState>({
   hint: '',
   reply: '',
   heard: '',
+  level: 0,
   muted: false,
   error: '',
 })
@@ -48,6 +49,9 @@ const phaseText = computed(() => {
 })
 
 const transcript = computed(() => state.value.hint || state.value.reply)
+
+/** RMS 大致落在 0.01-0.15，乘 9 再截断，安静时也能看出一点点动静 */
+const meterWidth = computed(() => Math.min(1, state.value.level * 9).toFixed(3))
 
 onMounted(async () => {
   const base = settingsStore.settings.systemPrompt?.trim()
@@ -139,6 +143,10 @@ function toggleMute() {
             </span>
           </div>
           <p class="phase">{{ state.error ? '没有接通' : phaseText }}</p>
+          <!-- 麦克风电平：能看见自己的声音确实进去了，才知道「打断不了」不是麦的问题 -->
+          <span class="meter">
+            <span class="fill" :style="{ transform: `scaleX(${meterWidth})` }" />
+          </span>
         </div>
 
         <div class="transcript">
@@ -310,6 +318,24 @@ function toggleMute() {
   font-size: 12.5px;
   color: var(--text-2);
   letter-spacing: 0.02em;
+}
+
+.meter {
+  width: 132px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.meter .fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transform-origin: left center;
+  transition: transform 0.12s linear;
 }
 
 .transcript {

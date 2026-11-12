@@ -15,16 +15,16 @@
  * 核心是 `turnId`：每轮自增，所有异步回调进来先比对，不匹配就直接丢掉——
  * 被打断的轮次里飞在半路上的 TTS、chat 事件、ASR 结果都不会污染新一轮。
  *
- * # 为什么播放时要丢弃识别结果
+ * # 播放时怎么区分「用户在说话」和「模型自己的回声」
  *
- * 播放时麦克风里混着 AEC 没消干净的 TTS 残留，识别器会解出一些零碎词，
- * 甚至触发端点判定，让模型「自己接自己」。所以：
- *   - 播放/生成期间的 `final` 一律丢弃
- *   - 用户插话靠**能量**判定（`onBargeIn`），不靠文本
- *   - 判定插话后立刻重置识别器，后面收到的才是真正用户在说的话
+ * 播放时麦克风里混着 AEC 没消干净的 TTS 残留，识别器会把它解成零碎词，
+ * 处理不好就会「自己接自己」。两个判据配合：
+ *   - **能量**（`onBargeIn`）：快，但外放时阈值必须抬高，容易打不中
+ *   - **识别文本**：慢半拍（要等端点），但「解出来的字是不是已经出现在这轮
+ *     回答里」几乎能百分百区分回声和真人
  *
- * 代价是插话的头一两个字可能丢。这个取舍是故意的：丢一个字几乎察觉不到，
- * 「不能插话」却非常明显。
+ * 只靠能量的时候，外放用户基本打断不了；所以文本这条必须留着——判定为真人
+ * 就立刻打断，并把他刚说的这句话直接拿去开新一轮，不浪费。
  */
 
 import { TTS_NOT_INSTALLED, stopChat, streamChat, ttsSay, ttsStatus, ttsWarmup } from './api'
@@ -63,6 +63,8 @@ export interface CallState {
   reply: string
   /** 已经交给播放队列的部分（历史里只写这个） */
   heard: string
+  /** 麦克风电平（0-1），界面画电平条用 */
+  level: number
   muted: boolean
   error: string
 }
@@ -286,6 +288,7 @@ export class VoiceConversation {
     hint: '',
     reply: '',
     heard: '',
+    level: 0,
     muted: false,
     error: '',
   }
@@ -326,9 +329,19 @@ export class VoiceConversation {
         this.emit()
       },
       onFinal: (text) => {
-        // 播放/生成期间解出来的字是模型自己的声音，丢掉
-        if (this.busy) return
-        void this.runTurn(text)
+        const clean = text.trim()
+        if (!clean) return
+
+        // 播放/生成期间解出来的字，绝大多数是自己声音的回声，丢掉；
+        // 但也可能真是用户在说话——这种情况下必须打断，而不是把他的话吞了。
+        // 「说了话没反应」是通话里最难受的失败方式，比偶尔误判一次严重得多。
+        if (this.busy) {
+          if (this.looksLikeEcho(clean)) return
+          this.interrupt()
+          void this.runTurn(clean)
+          return
+        }
+        void this.runTurn(clean)
       },
       onError: (err) => this.fail(err.message),
     })
@@ -506,6 +519,12 @@ export class VoiceConversation {
         const speech = await ttsSay(sentence, this.opts.sid, this.opts.speed, this.opts.model)
         // 合成期间可能已经被打断
         if (turn !== this.turnId) return
+        // 空音频不是「没声音」这种小事：正常句子不该返回 0 采样，
+        // 静默丢掉会变成「通话里凭空少了一句」，必须报出来
+        if (!speech.pcm || speech.durationMs <= 0) {
+          this.fail('语音合成返回了空音频：这一句没念出来（换模型重试或看日志）')
+          return
+        }
         this.engine?.enqueue(speech.pcm, speech.rate)
       })
       .catch((err) => {
@@ -515,6 +534,29 @@ export class VoiceConversation {
       .finally(() => {
         this.ttsBusy = Math.max(0, this.ttsBusy - 1)
       })
+  }
+
+  /**
+   * 这段识别结果像不像「模型自己的声音」。
+   *
+   * 播放时麦克风里混着 AEC 没消干净的残留，识别器会把它解成文字。判据是
+   * 「这段字是不是已经出现在这一轮的回答里」——回声必然来自已经说过的内容。
+   * 识别结果和原文常差一两个字，所以再按双字片段算一次命中率。
+   */
+  private looksLikeEcho(text: string): boolean {
+    const norm = (s: string) => s.replace(/[\s\p{P}\p{S}]/gu, '').toLowerCase()
+    const said = norm(text)
+    const reply = norm(this.state.reply)
+    // 空回答（正在思考，还没吐字）说明不可能有回声；一个字的短句也判不了，
+    // 宁可当成用户在说话
+    if (said.length < 2 || !reply) return false
+    if (reply.includes(said)) return true
+
+    const grams: string[] = []
+    for (let i = 0; i + 2 <= said.length; i += 1) grams.push(said.slice(i, i + 2))
+    if (grams.length === 0) return false
+    const hit = grams.filter((g) => reply.includes(g)).length
+    return hit / grams.length >= 0.6
   }
 
   /** 把这一轮写进历史。`heard` 而不是 `reply`：用户没听到的不该出现在上下文里 */
@@ -539,10 +581,10 @@ export class VoiceConversation {
     }
 
     const next: CallPhase = playing ? 'speaking' : this.generating ? 'thinking' : 'listening'
-    if (next !== this.state.phase) {
-      this.state = { ...this.state, phase: next }
-      this.emit()
-    }
+    // 电平每帧都变，所以这里无条件 emit：150ms 一次的小对象拷贝，比让界面
+    // 看着像「没听见你说话」便宜得多
+    this.state = { ...this.state, phase: next, level: this.engine?.level ?? 0 }
+    this.emit()
   }
 
   private fail(message: string) {

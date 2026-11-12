@@ -27,8 +27,15 @@ const DOWN = CTX_RATE / ASR_RATE
 /** 每次 IPC 送 100ms。太小会让 IPC 次数比推理还费，太大首字延迟变高 */
 const FRAME = ASR_RATE / 10
 
-/** 播放中判定「用户插话」需要的连续有声帧数（100ms/帧） */
-const BARGE_FRAMES = 3
+/** 播放中判定「用户插话」的观察窗口（100ms/帧）*/
+const BARGE_WINDOW = 4
+/**
+ * 窗口内至少有几帧超过阈值才算插话。
+ *
+ * 原先要求「连续 3 帧」，实测中文很难满足：字与字之间有塞音闭合，能量会掉一两帧，
+ * 于是一句话说完也没攒够 3 连——听起来就是「完全打断不了」。
+ */
+const BARGE_HITS = 2
 /** 一次打断之后多久内不再判定，避免自己打断自己 */
 const BARGE_COOLDOWN_MS = 700
 
@@ -87,12 +94,14 @@ export class AudioEngine {
   /** 环境底噪，用于自适应阈值 */
   private noiseFloor = 0.004
   private calibrated = 0
-  /** 连续超出打断阈值的帧数 */
-  private loudRun = 0
+  /** 最近几帧有没有超过打断阈值 */
+  private recentLoud: boolean[] = []
   private lastBargeAt = 0
   private speaking = false
   private muted = false
   private running = false
+  /** 最近一帧的 RMS，界面上画麦克风电平 */
+  private levelValue = 0
 
   private cbs: AudioEngineCallbacks
 
@@ -107,6 +116,16 @@ export class AudioEngine {
   /** 当前是否在出声（界面的「说话中」状态） */
   get isPlaying(): boolean {
     return this.playing.size > 0 || this.queue.length > 0
+  }
+
+  /**
+   * 麦克风电平（0-1 左右，未做归一化）。
+   *
+   * 界面拿它画电平条：能看见自己的声音有没有进去，就知道「打断不了」到底是
+   * 麦克风没收到还是阈值太高。
+   */
+  get level(): number {
+    return this.levelValue
   }
 
   async start(): Promise<void> {
@@ -155,7 +174,8 @@ export class AudioEngine {
     this.playing.clear()
     this.queue = []
     this.nextStart = 0
-    this.loudRun = 0
+    this.recentLoud = []
+    this.levelValue = 0
     this.noiseFloor = 0.004
     this.calibrated = 0
     this.muted = false
@@ -207,7 +227,16 @@ export class AudioEngine {
     const samples = decodePcm(pcm)
     if (samples.length === 0) return
 
-    const buffer = this.ctx.createBuffer(1, samples.length, rate)
+    // 上下文被浏览器挂起时，排进去的音频永远不响（切模型/切设备后最容易碰上）
+    if (this.ctx.state === 'suspended') void this.ctx.resume()
+
+    let buffer: AudioBuffer
+    try {
+      buffer = this.ctx.createBuffer(1, samples.length, rate)
+    } catch {
+      // 采样率超出 AudioBuffer 允许范围：按上下文采样率建，宁可音调不对也要出声
+      buffer = this.ctx.createBuffer(1, samples.length, this.ctx.sampleRate)
+    }
     // 用 getChannelData().set() 而不是 copyToChannel：后者在 TS 5.7 起的
     // TypedArray 泛型下要求 ArrayBuffer（非 SharedArrayBuffer），会报类型不符
     buffer.getChannelData(0).set(samples)
@@ -228,6 +257,7 @@ export class AudioEngine {
     }
     this.playing.clear()
     this.nextStart = 0
+    this.recentLoud = []
   }
 
   private pump() {
@@ -332,6 +362,9 @@ export class AudioEngine {
     const rms = rootMeanSquare(chunk)
     const ms = (chunk.length / ASR_RATE) * 1000
 
+    // 电平条：快升慢降，看起来才像「在动」而不是抽搐
+    this.levelValue = Math.max(rms, this.levelValue * 0.65)
+
     // 开头 300ms 采环境底噪（取最小值：用户可能立刻开口）
     if (this.calibrated < 300) {
       this.noiseFloor = this.calibrated === 0 ? rms : Math.min(this.noiseFloor, rms)
@@ -341,27 +374,28 @@ export class AudioEngine {
 
     const playing = this.isPlaying
     const threshold = playing
-      ? // 约 +9dB：够挡残留回声，又不至于要用户吼才能打断
-        Math.max(this.noiseFloor * 6, 0.045)
+      ? // 约 +12dB：够挡残留回声，又不至于要用户吼才能打断
+        Math.max(this.noiseFloor * 5, 0.035)
       : Math.min(Math.max(this.noiseFloor * 2.5, 0.012), 0.06)
 
     const loud = rms > threshold
 
     if (playing) {
-      if (loud) {
-        this.loudRun += 1
-        const now = Date.now()
-        if (this.loudRun >= BARGE_FRAMES && now - this.lastBargeAt > BARGE_COOLDOWN_MS) {
-          this.lastBargeAt = now
-          this.loudRun = 0
-          this.cbs.onBargeIn?.()
-        }
-      } else {
-        this.loudRun = 0
+      this.recentLoud.push(loud)
+      if (this.recentLoud.length > BARGE_WINDOW) this.recentLoud.shift()
+      const hits = this.recentLoud.filter(Boolean).length
+      const now = Date.now()
+      if (hits >= BARGE_HITS && now - this.lastBargeAt > BARGE_COOLDOWN_MS) {
+        this.lastBargeAt = now
+        this.recentLoud = []
+        this.cbs.onBargeIn?.()
       }
       // 播放期间不更新「用户在说话」状态：那时候麦克风里混着模型的声
       return
     }
+
+    // 没在放音时清掉窗口，免得下一次开口被上一轮的残留凑满
+    if (this.recentLoud.length > 0) this.recentLoud = []
 
     if (loud !== this.speaking) {
       this.speaking = loud
