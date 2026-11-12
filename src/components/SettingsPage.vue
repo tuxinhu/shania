@@ -1161,6 +1161,20 @@ onUnmounted(() => {
   height: 100vh;
   overflow: hidden;
   background: var(--bg);
+
+  /* 内容列宽：窄窗口按 720 走（再宽行内标签和控件就隔太远），窗口放开后
+     分档放宽，否则最大化时 720 会变成一条窄带飘在大片空白中间 */
+  --col: 720px;
+}
+@media (min-width: 1280px) {
+  .page {
+    --col: 880px;
+  }
+}
+@media (min-width: 1600px) {
+  .page {
+    --col: 1000px;
+  }
 }
 
 /* ---------- 左侧导航 ---------- */
@@ -1257,8 +1271,8 @@ onUnmounted(() => {
   display: flex;
   align-items: flex-start;
   gap: 16px;
-  /* 与 .wrap 完全一致：标题、「完成」按钮、下面的表单都落在同一条中轴上 */
-  max-width: 720px;
+  /* 与 .wrap 同宽：标题、「完成」按钮、下面的表单落在同一条中轴上 */
+  max-width: var(--col);
   margin: 0 auto;
 }
 
@@ -1314,7 +1328,7 @@ onUnmounted(() => {
 /* 内容不铺满：一行拉到 1200px 宽时，标签和控件会隔得老远，扫视很累。
    限宽之后居中而不是靠左——窗口一宽，靠左会让右侧空出一大片死白 */
 .wrap {
-  max-width: 720px;
+  max-width: var(--col);
   margin: 0 auto;
 }
 
