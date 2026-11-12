@@ -90,9 +90,18 @@ if (mode === 'chat' || mode === 'chat-dark') {
   await sleep(9000)
 }
 
-if (mode === 'settings') {
+if (mode === 'settings' || mode.startsWith('settings:')) {
   await evaluate("document.querySelector('.foot-btn')?.click()")
   await sleep(600)
+  // settings:语音 —— 冒号后面是导航项文字（前缀匹配），用来逐页验收
+  const tab = mode.split(':')[1]
+  if (tab) {
+    await evaluate(
+      `[...document.querySelectorAll('.nav-item')]` +
+        `.find((b) => b.textContent.trim().startsWith(${JSON.stringify(tab)}))?.click()`,
+    )
+    await sleep(500)
+  }
 }
 
 fs.mkdirSync(path.dirname(outFile), { recursive: true })
