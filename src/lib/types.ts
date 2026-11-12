@@ -66,7 +66,7 @@ export type ThemeMode = 'system' | 'light' | 'dark'
 export type CloseAction = 'tray' | 'quit'
 
 /** 语音合成模型的选择（`auto` 由后端按可用性挑，matcha 优先） */
-export type TtsModel = 'auto' | 'matcha' | 'kokoro'
+export type TtsModel = 'auto' | 'melo' | 'matcha' | 'kokoro'
 
 /** 一套可保存的模型接入配置 */
 export interface ModelProfile {
@@ -105,8 +105,9 @@ export interface AppSettings {
   ttsSpeed: number
   /**
    * 用哪个合成模型。
-   * - `auto`：装了哪个用哪个，matcha 优先（快）
-   * - `matcha`：单音色、RTF 0.06，通话首选
+   * - `auto`：装了哪个用哪个，melo 优先
+   * - `melo`：中英混读、44.1kHz、单音色，RTF 0.32——中英混排的通话首选
+   * - `matcha`：最快（RTF 0.06）、中文最稳，但一个英文都不认得
    * - `kokoro`：103 音色、音质更好，但 RTF 0.5，通话首声会慢到 1.8 秒
    *
    * 指定的模型没装时自动回退，不会变成没声音。

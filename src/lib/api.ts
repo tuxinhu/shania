@@ -189,10 +189,10 @@ export async function ttsUnload(): Promise<void> {
 
 /**
  * 下载语音合成模型。`kind` 省略时按设置里选的来。
- * matcha 约 126MB（模型包 + 单独发布的声码器），kokoro 约 348MB。
+ * melo 约 163MB；matcha 约 126MB（模型包 + 单独发布的声码器）；kokoro 约 348MB。
  * 进度走 stt-progress，stage 为 tts。
  */
-export async function ttsInstall(kind?: 'matcha' | 'kokoro'): Promise<void> {
+export async function ttsInstall(kind?: TtsModel): Promise<void> {
   if (!isTauri) throw new Error('浏览器预览环境不支持安装语音模型')
   // 显式传 null 而不是省略：Rust 侧是 Option<String>，缺参数在旧版本 Tauri 上会报错
   await invoke('tts_install', { kind: kind ?? null })

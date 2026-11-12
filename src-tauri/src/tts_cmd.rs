@@ -115,7 +115,7 @@ pub async fn tts_say(
 
 /// 模型状态：装没装、占多少磁盘、有没有加载进内存、有哪些音色。
 ///
-/// `model` 是前端当前的设置值（`auto` / `matcha` / `kokoro`）。必须显式传：
+/// `model` 是前端当前的设置值（`auto` / `melo` / `matcha` / `kokoro`）。必须显式传：
 /// 设置写盘有 250ms 防抖，刚切换完就来查时文件里还是旧值。
 #[tauri::command]
 pub fn tts_status(model: Option<String>, state: State<'_, TtsState>) -> TtsStatus {
@@ -129,7 +129,7 @@ pub fn tts_status(model: Option<String>, state: State<'_, TtsState>) -> TtsStatu
     // 能把「你选的这个其实没生效」直接显示出来
     let active = info.map(|(_, _, k)| k).or_else(|| tts::choose(&root, prefer));
 
-    let models: Vec<ModelStatus> = [tts::Kind::Matcha, tts::Kind::Kokoro]
+    let models: Vec<ModelStatus> = [tts::Kind::Melo, tts::Kind::Matcha, tts::Kind::Kokoro]
         .into_iter()
         .map(|kind| ModelStatus {
             id: kind.id().to_string(),
@@ -165,11 +165,11 @@ pub struct TtsStatus {
     /// 音色总数。没加载模型时为 0，前端据此决定音色选择器的范围。
     speakers: i32,
     rate: i32,
-    /// 当前用的模型（Matcha 单音色 / Kokoro 103 音色），没加载时为空
+    /// 当前用的模型（Melo / Matcha 单音色、Kokoro 103 音色），没加载时为空
     kind: String,
-    /// 当前生效模型的 id，`matcha` / `kokoro`
+    /// 当前生效模型的 id，`melo` / `matcha` / `kokoro`
     active_kind: String,
-    /// 两个模型各自装没装。设置面板按这个决定显示哪个下载按钮
+    /// 三个模型各自装没装。设置面板按这个决定显示哪个下载按钮
     models: Vec<ModelStatus>,
 }
 
@@ -210,8 +210,9 @@ pub async fn tts_warmup(model: Option<String>, state: State<'_, TtsState>) -> Re
 
 /// 下载并解压语音合成模型。
 ///
-/// `kind` 省略时按设置里的选择，再退到 matcha。matcha 要下两个文件（72MB 模型包
-/// + 54MB 声码器，声码器单独发布）；kokoro 是一个 348MB 的包。
+/// `kind` 省略时按设置里的选择，再退到 matcha。melo 是一个 163MB 的包；
+/// matcha 要下两个文件（72MB 模型包 + 54MB 声码器，声码器单独发布）；
+/// kokoro 是一个 348MB 的包。
 /// 进度走 `stt-progress`，`stage` 是 `tts`。
 #[tauri::command]
 pub async fn tts_install(app: AppHandle, kind: Option<String>) -> Result<(), String> {
@@ -231,6 +232,7 @@ pub async fn tts_install(app: AppHandle, kind: Option<String>) -> Result<(), Str
     std::fs::create_dir_all(&dest).map_err(|e| format!("创建目录失败：{e}"))?;
 
     match kind {
+        tts::Kind::Melo => install_melo(&app, &root, &dest).await?,
         tts::Kind::Matcha => install_matcha(&app, &root, &dest).await?,
         tts::Kind::Kokoro => install_kokoro(&app, &root, &dest).await?,
     }
@@ -254,6 +256,29 @@ pub async fn tts_install(app: AppHandle, kind: Option<String>) -> Result<(), Str
         kind.label()
     );
     Ok(())
+}
+
+async fn install_melo(
+    app: &AppHandle,
+    root: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    let url = tts::melo_url();
+    let archive = root.join("models").join("tts-melo.tar.bz2");
+    shania_core::log_info!("下载语音合成模型：{url}");
+
+    // GitHub 的连接经常在 120-160MB 之间断一次，而下载器不支持续传，
+    // 断了就整包重来是 163MB。这里的校验能保证「下了一半」不会被当成功
+    let got = download_with_progress(app, &url, &archive).await?;
+    if got != tts::MELO_BYTES {
+        let _ = std::fs::remove_file(&archive);
+        return Err(format!(
+            "模型包大小不对（得到 {got} 字节，应为 {}），已删除，请重试",
+            tts::MELO_BYTES
+        ));
+    }
+
+    extract(archive, dest.to_path_buf()).await
 }
 
 async fn install_matcha(

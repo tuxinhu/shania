@@ -201,46 +201,53 @@ scripts/stt-server.ps1                                    # 手动起服务的�
 
 #### 语音输出（本地 TTS）
 
-两个模型都是进程内 ONNX（和 X-ASR 共用同一个 `onnxruntime.dll`），不联网、不占显存、
+三个模型都是进程内 ONNX（和 X-ASR 共用同一个 `onnxruntime.dll`），不联网、不占显存、
 不需要单独的服务进程：
 
-| 模型 | 磁盘 | 实测合成耗时 | 音色 | 定位 |
+| 模型 | 磁盘 | 实测 RTF | 音色 | 定位 |
 |---|---|---|---|---|
-| `matcha-icefall-zh-baker` | 72MB + 54MB 声码器 | 12 字 132ms、20 字 243ms | 1 个女声 | 默认，中文通话用 |
-| `kokoro-multi-lang-v1_1` | 348MB | 12 字 1290ms、20 字 2420ms | 103 个 | 音质更自然，但中文词表覆盖不足 |
+| `vits-melo-tts-zh_en` | 170MB | 0.32–0.43 | 1 个女声 | **默认**，中英混读，44.1kHz |
+| `matcha-icefall-zh-baker` | 72MB + 54MB 声码器 | **0.04** | 1 个女声 | 最快，但一个英文都不认得 |
+| `kokoro-multi-lang-v1_1` | 348MB | 0.50 | 103 个 | 音色最多，中文词表覆盖不足 |
 
-**两个模型都没有英文能力**，差别只在于「哪些词念得出来」：
+**默认走 MeloTTS**：三个里只有它「中文准、英文也念得出来」。实测 20 字中英混排
+（`这个 API 的 token 需要重新生成，用 JSON 传`）4.0 秒音频用 1.3 秒合成，首声约 1.3 秒。
+Matcha 快 8 倍，但送英文进去返回**空音频**，中英混的句子会中间空一截——通话语境里
+「内容完整」比「快 0.4 秒」重要。
 
 | | 拉丁字母 | 阿拉伯数字 | 中文 |
 |---|---|---|---|
-| Matcha | lexicon 里 0 个英文词，全部删掉 | 靠 `number.fst` 转中文读法 | 逐字查拼音，覆盖完整 |
-| Kokoro | 保留 17.8 万词英文表里有的（`settings`/`base` 能念），其余的删掉 | 靠 `number-zh.fst` | 按词查注音表，**表里没有的词会退回拼音、念成英文音** |
+| MeloTTS | 11.2 万词表，**表外缩写也念**（API/JSON/GPU 逐字母） | `number.fst` | 完整，另有 `new_heteronym.fst` 处理多音字 |
+| Matcha | lexicon 里 0 个英文词，全部删掉 | `number.fst` | 逐字查拼音，覆盖完整 |
+| Kokoro | 保留 17.8 万词英文表里有的，其余删掉 | `number-zh.fst` | 按词查注音表，**表外常用词会念成英文音** |
 
-kokoro 那行是它最要命的缺陷：「好的」「我看了下」这类常用词不在 68036 行词表里，
-会被念成 “how did”、“well, can less”。所以**中文通话一律用 Matcha**，Kokoro 留给
-英文内容或「不在乎个别词念错、只要音色好听」的朗读场景。
+拉丁字母的处理在 `tts.rs` 的 `Latin`：`Drop`（Matcha，整词删）、`Allow(HashSet)`
+（Kokoro，查表保留）、`Keep`（MeloTTS，原样保留）。删而不是留着，是因为留着会念出
+不相干的音——实测 “API” 和 “GPT” 都念成 “total”，两个词撞成同一个音，听感上就是
+「同一个字被重读了两遍」。
 
-英文词的处理逻辑在 `tts.rs` 的 `Latin`：`Drop`（Matcha，整词删）和
-`Allow(HashSet)`（Kokoro，查表保留）。删而不是留着，是因为留着会念出不相干的音——
-实测 “API” 和 “GPT” 都念成 “total”，两个不同的词撞成同一个音，听感上就是「同一个字
-被重读了两遍」。
+MeloTTS 的输出峰值只有 0.07–0.25（Matcha 是 0.60），所以合成后按句归一化到 0.85。
+用固定倍数不行：4 倍会让本来就有 0.25 的句子撞到 1.0 削波，削波是「滋」的一声，
+比声音小难听得多。
 
-模型吐出来的 markdown 结构也在两处拦掉（`Splitter` 和 `sanitize`）：**``` 代码块整段
-不念**（不然 Kokoro 会把 `for line in buf` 里的 for/in/line 当真英文念出来），表格分隔行
-跳过，路径和代码剩下的符号串（`://`、`+`、`() {`）整段删掉——中文合成器会把它们念成
-「冒号斜杠斜杠」，或者干脆卡住不吐音。单个英文句读符号（`1: 打开设置`）翻成中文标点，
-停顿保留。
+模型吐出来的 markdown 结构在两处拦掉（`Splitter` 和 `sanitize`）：**``` 代码块整段
+不念**，表格分隔行跳过，路径和代码剩下的符号串（`://`、`+`、`() {`）整段删掉——
+中文合成器会把它们念成「冒号斜杠斜杠」，或者干脆卡住不吐音。单个英文句读符号
+（`1: 打开设置`）翻成中文标点，停顿保留。
 
-切换在「设置 → 语音输出 → 合成模型」，三选一：**自动 / Matcha / Kokoro**。
-存进 `settings.json` 的 `ttsModel`，取值 `auto` | `matcha` | `kokoro`：
+切换在「设置 → 语音输出 → 合成模型」，四选一：**自动 / MeloTTS / Matcha / Kokoro**。
+存进 `settings.json` 的 `ttsModel`，取值 `auto` | `melo` | `matcha` | `kokoro`：
 
-- `auto`：装了哪个用哪个，Matcha 优先（快）
+- `auto`：装了哪个用哪个，MeloTTS 优先
 - 指定的模型没装 → 自动回退到已装的那个，并且设置页会用红字说明「现在实际在用谁」，
   不会出现「选了却没声音」
-- 切换时会把内存里的旧模型丢掉，下次合成按新选择重新加载（两个模型同时驻留要多占 350MB）
+- 切换时会把内存里的旧模型丢掉，下次合成按新选择重新加载（三个同时驻留要多占 500MB）
 
-需要镜像时用 `SHANIA_TTS_URL`（Matcha 包）/ `SHANIA_TTS_VOCODER_URL`（声码器）/
-`SHANIA_TTS_KOKORO_URL`（Kokoro 包）覆盖下载地址。
+需要镜像时用 `SHANIA_TTS_MELO_URL` / `SHANIA_TTS_URL`（Matcha 包）/
+`SHANIA_TTS_VOCODER_URL`（声码器）/ `SHANIA_TTS_KOKORO_URL`（Kokoro 包）覆盖下载地址。
+
+MeloTTS 包里有一个 133 字节的 `model.int8.onnx`——那是 git-lfs 指针文件，不是模型。
+挑文件时必须点名 `model.onnx`，否则加载它只会报「模型与 sherpa-onnx 版本不匹配」。
 
 
 **MCP 工具**：配置文件 `~/.shania/mcp.json`（不存在视为没有 MCP）。

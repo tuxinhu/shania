@@ -1,19 +1,21 @@
-//! 本地语音合成：进程内 ONNX 推理，两种模型按可用性自动选择。
+//! 本地语音合成：进程内 ONNX 推理，三种模型按可用性自动选择。
 //!
-//! # 两个模型，用途不同
+//! # 三个模型，用途不同
 //!
-//! | 模型 | 大小 | 实测 RTF | 音色 | 用途 |
+//! | 模型 | 大小 | 实测 RTF | 音色 | 特点 |
 //! |---|---|---|---|---|
-//! | matcha-icefall-zh-baker | 72+54MB | **0.04** | 1 个女声 | 默认，通话必须用它 |
-//! | kokoro-multi-lang-v1_1 | 348MB | 0.50 | 103 个 | 音质更好，但太慢 |
+//! | vits-melo-tts-zh_en | 170MB | 0.32 | 1 个女声 | **默认**，中英混读，44.1kHz |
+//! | matcha-icefall-zh-baker | 72+54MB | **0.04** | 1 个女声 | 最快，但一个英文都不认得 |
+//! | kokoro-multi-lang-v1_1 | 348MB | 0.50 | 103 个 | 音色多，中文词表残缺 |
 //!
-//! RTF 0.5 意味着「合成 10 秒语音要 5 秒 CPU」，一句 8 字也要近 1 秒——
-//! 通话的总延迟预算只有 1.2 秒，所以**通话走 matcha**。Kokoro 保留着，因为
-//! 它的音色明显更自然，将来做「朗读整篇文章」这类不怕等一等的场景更合适。
+//! 默认走 melo：它是这三个里唯一「中文准、英文也念得出来」的。matcha 快 8 倍，
+//! 但送英文进去返回 0 采样——不是念错，是完全不出声，中英混排的句子会中间空
+//! 一截。通话语境里「内容完整」比「快 0.4 秒」重要。
 //!
-//! 探测顺序是 matcha 优先：两个都装了也先用快的那个。用户在设置里指定了
-//! 「只用 Kokoro / 只用 Matcha」时按用户的来（[`choose`]），指定的那个没装
-//! 就退回自动，不会变成「没声音」。
+//! Kokoro 的 103 个音色留着给朗读长文用，通话不推荐（首声 1.8 秒）。
+//!
+//! 探测顺序 melo 优先。用户在设置里指定了模型时按用户的来（[`choose`]），
+//! 指定的那个没装就退回自动，不会变成「没声音」。
 //!
 //! # 为什么整句合成而不是流式回调
 //!
@@ -37,9 +39,16 @@ use sherpa_onnx::{
 
 use crate::stream_stt::{pick, scan};
 
+pub const MELO_DIR: &str = "vits-melo-tts-zh_en";
 pub const MATCHA_DIR: &str = "matcha-icefall-zh-baker";
 pub const KOKORO_DIR: &str = "kokoro-multi-lang-v1_1";
 
+/// melo 的压缩包（163MB，解压 170MB 的 fp32 模型）
+///
+/// 包里还有一个 `model.int8.onnx`，只有 **133 字节**——那是 git-lfs 的指针
+/// 文件，不是模型。挑文件时必须点名 `model.onnx`，否则加载的是它，报「模型
+/// 与 sherpa-onnx 版本不匹配」。
+pub const MELO_BYTES: u64 = 167_006_755;
 /// matcha 的声学模型包
 pub const MATCHA_BYTES: u64 = 75_455_508;
 /// matcha 的声码器（单独发布，不在压缩包里）
@@ -60,6 +69,8 @@ pub fn vocoder_name() -> &'static str {
 
 const KOKORO_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_1.tar.bz2";
+const MELO_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-melo-tts-zh_en.tar.bz2";
 
 /// 允许用镜像覆盖（国内直连 GitHub 经常只有几十 KB/s）
 pub fn matcha_url() -> String {
@@ -67,6 +78,13 @@ pub fn matcha_url() -> String {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| MATCHA_URL.to_string())
+}
+
+pub fn melo_url() -> String {
+    std::env::var("SHANIA_TTS_MELO_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| MELO_URL.to_string())
 }
 
 pub fn vocoder_url() -> String {
@@ -86,6 +104,7 @@ pub fn kokoro_url() -> String {
 /// 用哪种模型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    Melo,
     Matcha,
     Kokoro,
 }
@@ -93,13 +112,15 @@ pub enum Kind {
 impl Kind {
     pub fn label(&self) -> &'static str {
         match self {
-            Kind::Matcha => "Matcha（快，单音色）",
+            Kind::Melo => "MeloTTS（中英混，单音色）",
+            Kind::Matcha => "Matcha（最快，单音色，不会英文）",
             Kind::Kokoro => "Kokoro（慢，103 音色）",
         }
     }
 
     pub fn dir_name(&self) -> &'static str {
         match self {
+            Kind::Melo => MELO_DIR,
             Kind::Matcha => MATCHA_DIR,
             Kind::Kokoro => KOKORO_DIR,
         }
@@ -108,6 +129,7 @@ impl Kind {
     /// 存进 `settings.json` 的标识
     pub fn id(&self) -> &'static str {
         match self {
+            Kind::Melo => "melo",
             Kind::Matcha => "matcha",
             Kind::Kokoro => "kokoro",
         }
@@ -115,6 +137,7 @@ impl Kind {
 
     pub fn from_id(s: &str) -> Option<Kind> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "melo" | "melotts" => Some(Kind::Melo),
             "matcha" => Some(Kind::Matcha),
             "kokoro" => Some(Kind::Kokoro),
             _ => None,
@@ -124,8 +147,47 @@ impl Kind {
     /// 压缩包大小，下载完拿来校验，防止存到半截文件或错误页
     pub fn archive_bytes(&self) -> u64 {
         match self {
+            Kind::Melo => MELO_BYTES,
             Kind::Matcha => MATCHA_BYTES,
             Kind::Kokoro => KOKORO_BYTES,
+        }
+    }
+
+    /// 合成时开多少线程。
+    ///
+    /// melo 的声学模型是自回归结构，单步慢，核给少了就是在干等——实测 4 线程
+    /// RTF 0.50、8 线程 0.40，再多收益就平了。另外两个是前馈模型，2-4 线程
+    /// 已经够，开满只会跟 X-ASR 抢 CPU（识别卡顿比合成慢更影响通话）。
+    fn threads(&self) -> i32 {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(4);
+        match self {
+            Kind::Melo => (cores / 2).clamp(4, 10),
+            _ => cores.clamp(2, 4),
+        }
+    }
+
+    /// 目标峰值：`None` 表示原样输出。
+    ///
+    /// melo 的峰值只有 0.07-0.25，matcha 是 0.60——同样把系统音量开满，听感
+    /// 差一个数量级，用户第一反应是「这个模型坏了」。按句归一化到 0.85，
+    /// 而不是乘一个固定倍数：固定 4 倍会让本来就有 0.25 的句子撞到 1.0 削波
+    /// （实测「长句」和带 markdown 的那句都满了），削波听起来是「滋」的一声，
+    /// 比声音小难听得多。
+    fn target_peak(&self) -> Option<f32> {
+        match self {
+            Kind::Melo => Some(0.85),
+            _ => None,
+        }
+    }
+
+    /// 超过这个耗时就在日志里记一条（超过正常水平＝机器在忙或选错了模型）
+    fn slow_ms(&self) -> u128 {
+        match self {
+            Kind::Melo => 2500,
+            Kind::Matcha => 800,
+            Kind::Kokoro => 3000,
         }
     }
 }
@@ -161,6 +223,7 @@ pub fn files(root: &Path) -> Option<Files> {
 /// 指定模型的可用文件，没装完整则返回 None。
 pub fn files_for(root: &Path, kind: Kind) -> Option<Files> {
     match kind {
+        Kind::Melo => melo_files(root),
         Kind::Matcha => matcha_files(root),
         Kind::Kokoro => kokoro_files(root),
     }
@@ -168,16 +231,16 @@ pub fn files_for(root: &Path, kind: Kind) -> Option<Files> {
 
 /// 这一轮该用哪个模型。
 ///
-/// `prefer` 来自设置里的 `ttsModel`（`auto` / `matcha` / `kokoro`）。指定的那个
-/// 没装就退回自动——否则用户点「只用 Kokoro」却没下模型，会从「音质差一点」
-/// 变成「完全不出声」。
+/// `prefer` 来自设置里的 `ttsModel`（`auto` / `melo` / `matcha` / `kokoro`）。
+/// 指定的那个没装就退回自动——否则用户点「只用 Melo」却没下模型，会从
+/// 「音质差一点」变成「完全不出声」。
 pub fn choose(root: &Path, prefer: Option<Kind>) -> Option<Kind> {
     if let Some(kind) = prefer {
         if files_for(root, kind).is_some() {
             return Some(kind);
         }
     }
-    [Kind::Matcha, Kind::Kokoro]
+    [Kind::Melo, Kind::Matcha, Kind::Kokoro]
         .into_iter()
         .find(|k| files_for(root, *k).is_some())
 }
@@ -194,6 +257,52 @@ pub fn size(root: &Path, kind: Kind) -> u64 {
         .filter_map(|p| std::fs::metadata(p).ok())
         .map(|m| m.len())
         .sum()
+}
+
+fn melo_files(root: &Path) -> Option<Files> {
+    let base = dir(root, Kind::Melo);
+    let mut all = Vec::new();
+    scan(&base, &mut all, 0);
+    if all.is_empty() {
+        return None;
+    }
+
+    // 点名 model.onnx：包里同时有一个 133 字节的 model.int8.onnx（git-lfs 指针），
+    // 按关键词模糊匹配可能挑到它，加载时只报「版本不匹配」，很难查
+    let model = all
+        .iter()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("model.onnx"))
+        .cloned()
+        .or_else(|| pick(&all, "model", ".onnx"))?;
+    let tokens = pick(&all, "tokens", ".txt")?;
+    let lexicon = pick(&all, "lexicon", ".txt")?.display().to_string();
+
+    // 四个 FST 各有分工：数字、日期、电话号码，以及 new_heteronym（多音字，
+    // 「银行/行走」这类）。少一个不会崩，但那类词会念错
+    let fsts: Vec<String> = ["phone", "date", "number", "new_heteronym"]
+        .into_iter()
+        .filter_map(|name| pick(&all, name, ".fst"))
+        .map(|p| p.display().to_string())
+        .collect();
+
+    let dict = base.join("dict");
+
+    Some(Files {
+        kind: Kind::Melo,
+        model,
+        tokens,
+        lexicon,
+        // melo 不走白名单：见 Latin::Keep 的说明
+        english: None,
+        rule_fsts: if fsts.is_empty() {
+            None
+        } else {
+            Some(fsts.join(","))
+        },
+        voices: None,
+        vocoder: None,
+        dict_dir: if dict.is_dir() { Some(dict) } else { None },
+    })
 }
 
 fn matcha_files(root: &Path) -> Option<Files> {
@@ -341,6 +450,8 @@ struct Loaded {
     kind: Kind,
     /// 念得出哪些英文词
     latin: Latin,
+    /// 归一化目标峰值（melo 的原始输出太小），`None` 表示原样输出
+    target_peak: Option<f32>,
 }
 
 impl Loaded {
@@ -397,11 +508,21 @@ impl Speech for Loaded {
                 rate: self.rate,
             });
         };
-        let samples = audio.samples().to_vec();
+        let mut samples = audio.samples().to_vec();
+        if let Some(target) = self.target_peak {
+            let peak = samples.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+            if peak > 0.001 {
+                // 上限 10 倍：极安静的句子放大到 0.85 就够，再往上只会把底噪也拉起来
+                let gain = (target / peak).clamp(1.0, 10.0);
+                for s in &mut samples {
+                    *s = (*s * gain).clamp(-1.0, 1.0);
+                }
+            }
+        }
 
-        // matcha 的 RTF 是 0.04，慢到这个程度说明机器在忙或者模型选错了
+        // 慢到这个程度说明机器在忙，或者模型选错了
         let elapsed = began.elapsed();
-        if elapsed.as_millis() > 800 {
+        if elapsed.as_millis() > self.kind.slow_ms() as u128 {
             crate::log_warn!(
                 "TTS 合成偏慢：{} 字用了 {}ms（{}，{} 采样）",
                 clean.chars().count(),
@@ -480,14 +601,39 @@ impl Engine {
         let files = files_for(root, want).ok_or_else(|| "语音合成模型还没装好".to_string())?;
         let began = Instant::now();
 
-        // 英文词表：kokoro 有 17.8 万词的英文 lexicon，只有表里的词念得对；
-        // matcha 一行英文都没有，全删
-        let latin = match &files.english {
-            Some(path) => Latin::Allow(load_words(path)),
-            None => Latin::Drop,
+        // 英文处理：kokoro 有 17.8 万词的英文 lexicon，只有表里的词念得对；
+        // matcha 一行英文都没有，全删；melo 自己就是中英混，全留
+        let latin = match files.kind {
+            Kind::Melo => Latin::Keep,
+            Kind::Matcha => Latin::Drop,
+            Kind::Kokoro => match &files.english {
+                Some(path) => Latin::Allow(load_words(path)),
+                None => Latin::Drop,
+            },
         };
 
+        let threads = files.kind.threads();
         let model_config = match files.kind {
+            Kind::Melo => OfflineTtsModelConfig {
+                vits: sherpa_onnx::OfflineTtsVitsModelConfig {
+                    model: Some(files.model.to_string_lossy().to_string()),
+                    lexicon: Some(files.lexicon.clone()),
+                    tokens: Some(files.tokens.to_string_lossy().to_string()),
+                    dict_dir: files
+                        .dict_dir
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string()),
+                    // 官方示例值：0.667 是发音模型的随机度，调大更「有感情」也更
+                    // 容易吞字；noise_scale_w 控制时长抖动
+                    noise_scale: 0.667,
+                    noise_scale_w: 0.8,
+                    length_scale: 1.0,
+                    ..Default::default()
+                },
+                num_threads: threads,
+                debug: false,
+                ..Default::default()
+            },
             Kind::Matcha => {
                 let vocoder = files
                     .vocoder
@@ -507,7 +653,7 @@ impl Engine {
                         length_scale: 1.0,
                         ..Default::default()
                     },
-                    num_threads: thread_count(),
+                    num_threads: threads,
                     debug: false,
                     ..Default::default()
                 }
@@ -532,7 +678,7 @@ impl Engine {
                         length_scale: 1.0,
                         ..Default::default()
                     },
-                    num_threads: thread_count(),
+                    num_threads: threads,
                     debug: false,
                     ..Default::default()
                 }
@@ -558,6 +704,7 @@ impl Engine {
             speakers,
             kind: files.kind,
             latin,
+            target_peak: files.kind.target_peak(),
         });
 
         crate::log_info!(
@@ -586,13 +733,6 @@ impl Engine {
     }
 }
 
-fn thread_count() -> i32 {
-    // 合成是计算密集的，线程开太多在核少的小机器上反而更慢
-    std::thread::available_parallelism()
-        .map(|n| n.get().clamp(2, 4) as i32)
-        .unwrap_or(2)
-}
-
 /* ------------------------------------------------------------------ */
 /* 文本处理                                                             */
 /* ------------------------------------------------------------------ */
@@ -602,7 +742,7 @@ fn thread_count() -> i32 {
 /// 主要是防 markdown：模型偶尔会不听招呼吐 `**强调**` 或反引号，直接喂进
 /// 合成器会被念成「星号星号」。通话模式虽然另外下了 prompt 约束，但这一层
 /// 不能省——prompt 是概率性的，清洗是确定的。
-/// 拉丁字母的白名单策略。
+/// 拉丁字母的处理策略。
 ///
 /// 中文模型念不出英文：matcha 的 lexicon 有 66375 行、**一个英文词都没有**，
 /// kokoro 有 17 万词的英文表。念不出的时候不是安静跳过，而是被映射成别的音素——
@@ -616,6 +756,12 @@ pub enum Latin {
     Drop,
     /// 只留词典里有的，顺便统一小写——`Settings` 转成 `settings` 才查得到（kokoro）
     Allow(std::collections::HashSet<String>),
+    /// 全留（melo）
+    ///
+    /// melo 本身就是中英混模型，lexicon 11.2 万条含中英音素；表外的缩写
+    /// （API / JSON / GPU）它也出声——实测是逐字母念出来的，不是吞掉。
+    /// 所以这里不需要白名单，查表反而会误删新词和专有名词。
+    Keep,
 }
 
 impl Latin {
@@ -624,6 +770,7 @@ impl Latin {
         match self {
             Latin::Drop => None,
             Latin::Allow(set) => set.contains(&lower).then_some(lower),
+            Latin::Keep => Some(word.to_string()),
         }
     }
 }
@@ -1107,6 +1254,29 @@ mod tests {
         assert!(s.push("好的我明白了。").len() == 1);
         assert!(s.push("。。。。。。").is_empty());
         assert!(s.flush().is_none());
+    }
+
+    #[test]
+    fn melo_keeps_english_words() {
+        // melo 自己就是中英混模型：表外缩写也念得出来（实测 API/JSON/GPU 都出声），
+        // 所以清洗层不查白名单，原文照留
+        let out = sanitize_with("用 API 调 JSON，再传给 GPU", &Latin::Keep);
+        assert!(out.contains("API"), "API 被删掉了：{out}");
+        assert!(out.contains("JSON"), "JSON 被删掉了：{out}");
+        assert!(out.contains("GPU"), "GPU 被删掉了：{out}");
+    }
+
+    #[test]
+    fn matcha_still_drops_english() {
+        // 对照：matcha 一个英文都不认，留着会念成不相干的音
+        assert_eq!(sanitize("用 API 调 JSON"), "用 调");
+    }
+
+    #[test]
+    fn only_melo_normalizes_volume() {
+        assert_eq!(Kind::Melo.target_peak(), Some(0.85));
+        assert_eq!(Kind::Matcha.target_peak(), None);
+        assert_eq!(Kind::Kokoro.target_peak(), None);
     }
 
     #[test]

@@ -26,6 +26,7 @@ import {
 import { acceleratorFromEvent, formatShortcut } from '@/lib/shortcut'
 import { useChatStore } from '@/stores/chat'
 import { useSettingsStore } from '@/stores/settings'
+import type { TtsModel } from '@/lib/types'
 
 const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'update:open', value: boolean): void }>()
@@ -371,8 +372,16 @@ const modelRow = (id: string) => tts.value?.models.find((m) => m.id === id)
 const modelReady = (id: string) => !!modelRow(id)?.ready
 const modelBytes = (id: string) => Math.round((modelRow(id)?.bytes ?? 0) / 1024 / 1024)
 
-/** 音色总数只有加载模型之后才知道；matcha 只有 1 个 */
+/** 音色总数只有加载模型之后才知道；melo 和 matcha 都只有 1 个 */
 const speakerCount = computed(() => (activeKind.value === 'kokoro' ? (tts.value?.speakers ?? 0) : 0))
+
+/** 模型 id → 界面显示的名字 */
+const TTS_NAMES: Record<string, string> = {
+  melo: 'MeloTTS',
+  matcha: 'Matcha',
+  kokoro: 'Kokoro',
+}
+const ttsName = (id: string) => TTS_NAMES[id] ?? id
 
 /**
  * 选了某个模型但它没装好——只看「装没装」，不看后端当前加载的是谁。
@@ -402,7 +411,7 @@ const ttsStateText = computed(() => {
   // 只报当前生效那个模型的体积：两个加起来（138+406MB）会让人以为程序很占地方
   const active = tts.value.models.find((m) => m.active)
   const mb = Math.round((active?.bytes ?? 0) / 1024 / 1024)
-  const name = activeKind.value === 'kokoro' ? 'Kokoro' : 'Matcha'
+  const name = ttsName(activeKind.value)
   return tts.value.loaded
     ? `运行中：${name}（${mb}MB，${tts.value.speakers} 音色）`
     : `将使用：${name}（${mb}MB），用到时加载`
@@ -421,7 +430,7 @@ async function refreshTts() {
  */
 // 已经加载进内存的旧模型必须丢掉：否则 `tts_say` 里那句「已加载且种类相同
 // 就直接用」会让切换看起来没生效，用户得重启程序才发现。
-async function switchModel(id: 'auto' | 'matcha' | 'kokoro') {
+async function switchModel(id: TtsModel) {
   if (settingsStore.settings.ttsModel === id || ttsSwitching.value) return
   settingsStore.settings.ttsModel = id
   ttsError.value = ''
@@ -439,7 +448,7 @@ async function switchModel(id: 'auto' | 'matcha' | 'kokoro') {
   }
 }
 
-async function installTts(kind: 'matcha' | 'kokoro') {
+async function installTts(kind: TtsModel) {
   if (ttsInstalling.value) return
   const firstOne = !tts.value?.ready
   ttsInstalling.value = kind
@@ -820,7 +829,16 @@ onUnmounted(() => {
                       @click="switchModel('auto')"
                     >
                       <span class="tts-opt-name">自动</span>
-                      <span class="tts-opt-desc">装了哪个用哪个，Matcha 优先</span>
+                      <span class="tts-opt-desc">装了哪个用哪个，MeloTTS 优先</span>
+                    </button>
+                    <button
+                      class="tts-opt"
+                      :class="{ on: chosenModel === 'melo' }"
+                      :disabled="ttsSwitching"
+                      @click="switchModel('melo')"
+                    >
+                      <span class="tts-opt-name">MeloTTS</span>
+                      <span class="tts-opt-desc">中英混读 · 44.1kHz · RTF 0.32</span>
                     </button>
                     <button
                       class="tts-opt"
@@ -829,7 +847,7 @@ onUnmounted(() => {
                       @click="switchModel('matcha')"
                     >
                       <span class="tts-opt-name">Matcha</span>
-                      <span class="tts-opt-desc">快，单音色 · 中文最稳 · RTF 0.06</span>
+                      <span class="tts-opt-desc">最快 · 单音色 · 不会念英文 · RTF 0.06</span>
                     </button>
                     <button
                       class="tts-opt"
@@ -843,22 +861,28 @@ onUnmounted(() => {
                   </div>
 
                   <p v-if="chosenModel === 'kokoro'" class="tts-warn">
-                    Kokoro 的中文词表覆盖不如 Matcha：像「好的」「我看了下」这类常用词不在词表里，
-                    会被按拼音念成英文音（听起来像重复或念错）。要念中文通话，建议用 Matcha。
+                    Kokoro 的中文词表覆盖不如 MeloTTS：像「好的」「我看了下」这类常用词不在词表里，
+                    会被按拼音念成英文音（听起来像重复或念错）。通话建议用 MeloTTS。
+                  </p>
+
+                  <p v-if="chosenModel === 'matcha'" class="tts-warn">
+                    Matcha 的词典里没有任何英文词条：遇到英文会整词删掉，中英混排的句子中间会空一截。
+                    要念英文请用 MeloTTS。
                   </p>
 
                   <p v-if="ttsSwitching" class="help">正在切模型，读模型文件要 2-3 秒…</p>
 
                   <p v-if="fellBack" class="tts-error">
-                    选的是 {{ chosenModel === 'kokoro' ? 'Kokoro' : 'Matcha' }}，但它的模型文件不完整，
-                    现在{{ ttsReady ? `用 ${activeKind === 'kokoro' ? 'Kokoro' : 'Matcha'} 顶着` : '完全没法合成' }}。
+                    选的是 {{ ttsName(chosenModel) }}，但它的模型文件不完整，
+                    现在{{ ttsReady ? `用 ${ttsName(activeKind)} 顶着` : '完全没法合成' }}。
                     点下面那一行的「下载」补全后会自动切过去。
                   </p>
                 </div>
 
-                <!-- 两个模型的下载/卸载各自独立：换模型不该逼用户重下已有的 -->
+                <!-- 各模型的下载/卸载各自独立：换模型不该逼用户重下已有的 -->
                 <div
                   v-for="m in [
+                    { id: 'melo', name: 'MeloTTS zh_en', size: '约 163MB', note: '中英混读，44.1kHz，单音色' },
                     { id: 'matcha', name: 'Matcha zh-baker', size: '约 126MB', note: '模型包 72MB + 声码器 54MB' },
                     { id: 'kokoro', name: 'Kokoro multi-lang v1.1', size: '约 348MB', note: '中英混排，103 个音色' },
                   ]"
@@ -883,7 +907,7 @@ onUnmounted(() => {
                       v-if="!modelReady(m.id)"
                       class="mini-btn primary"
                       :disabled="!!ttsInstalling"
-                      @click="installTts(m.id as 'matcha' | 'kokoro')"
+                      @click="installTts(m.id as TtsModel)"
                     >
                       {{ ttsInstalling === m.id ? '下载中…' : `下载（${m.size}）` }}
                     </button>
@@ -910,11 +934,13 @@ onUnmounted(() => {
                   </div>
                   <p v-if="ttsError" class="stt-error">{{ ttsError }}</p>
                   <p class="help">
-                    两个模型都在<strong>本进程内</strong>合成：不联网、不占显存、不需要单独的服务进程。
+                    三个模型都在<strong>本进程内</strong>合成：不联网、不占显存、不需要单独的服务进程。
                     <br />
-                    <strong>Matcha</strong> 实测 8 字 109ms，通话延迟预算里最省的一环，但它只有一个女声。
+                    <strong>MeloTTS</strong> 是默认：中文英文都念得出来，44.1kHz，8 字约 500ms。
                     <br />
-                    <strong>Kokoro</strong> 音色明显更自然，可是 RTF 是 0.5——一句 8 字要 960ms，
+                    <strong>Matcha</strong> 更快（8 字 109ms），但词典里一个英文词都没有，中英混排会中间空一截。
+                    <br />
+                    <strong>Kokoro</strong> 音色最多（103 个），可是 RTF 0.5——一句 8 字要 960ms，
                     通话首声会拖到 1.8 秒。想听它念长文可以选，做通话不推荐。
                   </p>
                 </div>
