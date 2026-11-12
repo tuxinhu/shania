@@ -94,6 +94,19 @@ export class AudioEngine {
   /** 环境底噪，用于自适应阈值 */
   private noiseFloor = 0.004
   private calibrated = 0
+  /**
+   * 播放期间「纯回声」的电平基线。
+   *
+   * 绝对阈值为什么不行：外放时残留回声本身就有 0.02-0.05，用户再叠加进来是
+   * 0.06-0.10，而安静房间里用户说话才 0.03——同一个数字在不同环境里含义完全
+   * 不同。实测就是「阈值定低了被自己的回声打断，定高了用户喊也打不断」。
+   *
+   * 所以改成跟基线比：基线快速下降（回声确实停了就立刻跟上）、缓慢上升
+   * （用户说话时不允许它把阈值一起抬走）。
+   */
+  private echoFloor = 0.01
+  /** 基线是否已经用本轮播放的电平播下种子 */
+  private echoSeeded = false
   /** 最近几帧有没有超过打断阈值 */
   private recentLoud: boolean[] = []
   private lastBargeAt = 0
@@ -178,6 +191,8 @@ export class AudioEngine {
     this.levelValue = 0
     this.noiseFloor = 0.004
     this.calibrated = 0
+    this.echoFloor = 0.01
+    this.echoSeeded = false
     this.muted = false
     this.running = true
   }
@@ -258,6 +273,8 @@ export class AudioEngine {
     this.playing.clear()
     this.nextStart = 0
     this.recentLoud = []
+    // 下一句是另一段声音，回声水平要从头量
+    this.echoSeeded = false
   }
 
   private pump() {
@@ -373,14 +390,26 @@ export class AudioEngine {
     }
 
     const playing = this.isPlaying
-    const threshold = playing
-      ? // 约 +12dB：够挡残留回声，又不至于要用户吼才能打断
-        Math.max(this.noiseFloor * 5, 0.035)
-      : Math.min(Math.max(this.noiseFloor * 2.5, 0.012), 0.06)
-
-    const loud = rms > threshold
 
     if (playing) {
+      // 每轮播放开始时用当时的电平播种子：合成音刚出来的这一刻，麦克风里
+      // 大致就是「纯回声」的水平，之后跟着它涨落
+      if (!this.echoSeeded) {
+        this.echoFloor = Math.max(rms, 0.004)
+        this.echoSeeded = true
+      }
+
+      // 先用旧基线判，再更新基线——否则用户开口的第一帧就把阈值一起抬走了
+      const threshold = Math.max(this.echoFloor * 2.2, 0.018)
+      const loud = rms > threshold
+
+      // 基线：降得快（回声真停了立刻跟上），升得慢（用户说话抬不动它）。
+      // 2%/帧 ≈ 1 秒才涨 18%，用户连说两句也不会被自己的基线挡住
+      this.echoFloor =
+        rms < this.echoFloor
+          ? this.echoFloor * 0.5 + rms * 0.5
+          : this.echoFloor * 0.98 + rms * 0.02
+
       this.recentLoud.push(loud)
       if (this.recentLoud.length > BARGE_WINDOW) this.recentLoud.shift()
       const hits = this.recentLoud.filter(Boolean).length
@@ -394,8 +423,13 @@ export class AudioEngine {
       return
     }
 
+    this.echoSeeded = false
+
     // 没在放音时清掉窗口，免得下一次开口被上一轮的残留凑满
     if (this.recentLoud.length > 0) this.recentLoud = []
+
+    const threshold = Math.min(Math.max(this.noiseFloor * 2.5, 0.012), 0.06)
+    const loud = rms > threshold
 
     if (loud !== this.speaking) {
       this.speaking = loud

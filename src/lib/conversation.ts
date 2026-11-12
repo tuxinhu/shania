@@ -282,6 +282,14 @@ export class VoiceConversation {
    */
   private pendingCommit = false
   private ticker: number | null = null
+  /**
+   * 播放期间连续几帧 partial 被判成「不是回声」。
+   *
+   * 单帧不算数：识别器会先吐一两个字的碎片（「我」「我想」），也可能被 AEC
+   * 残留带出一帧假文本。要连续两帧都像人话才动手，代价是晚 100-200ms，
+   * 换来的是不会自己打断自己。
+   */
+  private busyHits = 0
 
   private state: CallState = {
     phase: 'idle',
@@ -324,8 +332,26 @@ export class VoiceConversation {
 
     const asr = new StreamStt({
       onPartial: (text) => {
-        if (this.busy) return
-        this.state.hint = text
+        const clean = text.trim()
+
+        if (this.busy) {
+          // 播放/生成期间的 partial 是最快的打断信号：比等端点判定快半秒以上。
+          // 判据是「这几个字有没有出现在本轮回答里」——回声必然出现，用户自己
+          // 的话必然不出现。连续两帧都判成真人再动手，避开识别碎片的误判。
+          if (clean.length >= 2 && !this.looksLikeEcho(clean)) {
+            this.busyHits += 1
+            if (this.busyHits >= 2) {
+              this.busyHits = 0
+              this.interrupt(true)
+            }
+          } else {
+            this.busyHits = 0
+          }
+          return
+        }
+
+        this.busyHits = 0
+        this.state.hint = clean
         this.emit()
       },
       onFinal: (text) => {
@@ -337,7 +363,7 @@ export class VoiceConversation {
         // 「说了话没反应」是通话里最难受的失败方式，比偶尔误判一次严重得多。
         if (this.busy) {
           if (this.looksLikeEcho(clean)) return
-          this.interrupt()
+          this.interrupt(true)
           void this.runTurn(clean)
           return
         }
@@ -348,7 +374,9 @@ export class VoiceConversation {
 
     const engine = new AudioEngine({
       onFrame: (pcm) => this.asr?.feed(pcm),
-      onBargeIn: () => this.interrupt(),
+      // 能量判定比识别快（100ms 就能凑够帧），但它只知道「有声音」，不知道是
+      // 谁的声音。所以它负责「尽快停」，文字判定负责「确认是真人」。
+      onBargeIn: () => this.interrupt(true),
       onError: (err) => this.fail(err.message),
     })
 
@@ -399,8 +427,15 @@ export class VoiceConversation {
     this.emit()
   }
 
-  /** 打断（用户点按钮，或播放中被检测到插话） */
-  interrupt() {
+  /**
+   * 打断（用户点按钮，或播放中被检测到插话）。
+   *
+   * `keepAsr` 是这次改动里最要紧的一处：原来的实现打断时一律重启识别器，
+   * 用意是清掉缓冲区里的回声。可打断的时机恰恰是**用户正在说**——重启等于
+   * 把他已经出口的半句一起丢掉，体感就是「打断了，但我刚说的话没了，得重讲」。
+   * 所以自动判定命中（能量或文字）时保留缓冲区，只清人工按钮才重启。
+   */
+  interrupt(keepAsr = false) {
     if (!this.busy) return
 
     this.turnId += 1
@@ -411,12 +446,15 @@ export class VoiceConversation {
     this.splitter.reset()
     this.commit(true)
     this.pendingCommit = false
+    this.busyHits = 0
 
     this.state = { ...this.state, hint: '', reply: '', heard: '' }
     this.emit()
 
-    // 刚才那半句被 TTS 残留污染了，重开一个新会话
-    void this.asr?.restart(CALL_SILENCE).catch(() => {})
+    if (!keepAsr) {
+      // 剩下半句被 TTS 残留污染了，重开一个新会话（用户点按钮时走这条）
+      void this.asr?.restart(CALL_SILENCE).catch(() => {})
+    }
   }
 
   setMuted(value: boolean) {
