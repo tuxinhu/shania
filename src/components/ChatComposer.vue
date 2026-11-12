@@ -107,12 +107,22 @@ function setDraft(text: string) {
   draft.value = text
   nextTick(() => {
     resize()
-    ta.value?.focus()
+    focusInput()
     ta.value?.setSelectionRange(text.length, text.length)
   })
 }
 
-function focus() {
+/**
+ * 把键盘焦点交回输入框。
+ *
+ * 为什么单独抽一个：`focus()` 只有在**窗口（webview）本身拿着焦点**时才真的
+ * 把键盘焦点交出去。刚申请到麦克风、或窗口刚从别的程序切回来的那一瞬，
+ * `document.hasFocus()` 是 false，这时调 `focus()` 只会改掉 `activeElement`，
+ * 光标看不见、敲字和回车也落不到输入框——表现就是「识别出字了，但输入框
+ * 没聚焦」。所以必须在**点击按钮的那一刻**（用户激活还在、窗口必然聚焦）
+ * 先把焦点抢回来，而不是等识别结果回来再抢。
+ */
+function focusInput() {
   ta.value?.focus()
 }
 
@@ -331,6 +341,12 @@ async function startStream(): Promise<boolean> {
 }
 
 async function toggleVoice() {
+  // 就在点击这一刻把焦点交回输入框（见 `focusInput` 的说明）。放到后面 await
+  // 之后就晚了：打开麦克风那几百毫秒里 webview 可能已经丢了窗口焦点，那时再
+  // focus() 只会得到一个看不出效果的光标。开关两个方向都要——结束录音时用户
+  // 也要接着编辑刚识别出来的字。
+  focusInput()
+
   if (recording.value) {
     recording.value = false
     // 还在启动（打开麦克风 / 加载模型）里：这会儿 segmenter 和 stream 都还是空的，
@@ -557,7 +573,7 @@ onUnmounted(() => {
   document.removeEventListener('click', onDocClick)
 })
 
-defineExpose({ setDraft, focus })
+defineExpose({ setDraft, focus: focusInput })
 </script>
 
 <template>
@@ -605,6 +621,7 @@ defineExpose({ setDraft, focus })
             class="chip icon"
             :class="{ rec: recording, listening: speaking }"
             :title="voiceTitle"
+            @mousedown.prevent
             @click="toggleVoice"
           >
             <Icon :name="recording ? 'stop' : 'mic'" :size="13" />
