@@ -308,7 +308,10 @@ const backendHint = computed(() => {
 
 const whisperStateText = computed(() => {
   if (!stt.value) return '浏览器预览环境不可用'
-  if (!stt.value.serverReady) return '未安装'
+  if (!stt.value.serverReady) {
+    // 填了外部地址时本地装不装都无所谓，这里说「未安装」会让人误以为不能用
+    return settingsStore.settings.sttBaseUrl.trim() ? '走外部地址，未装本地服务' : '未安装'
+  }
   if (!stt.value.modelReady) {
     const got = Math.round(stt.value.modelBytes / 1024 / 1024)
     return got > 0 ? `服务端已装，模型下载未完成（${got}MB）` : '服务端已装，缺模型'

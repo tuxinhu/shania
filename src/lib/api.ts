@@ -159,7 +159,7 @@ export async function sttInstall(backend?: 'cpu' | 'cuda'): Promise<void> {
   await invoke('stt_install', { backend })
 }
 
-/** 确保本地服务在跑，返回端口；未安装时抛 STT_NOT_INSTALLED */
+/** 确保 whisper 本地进程在跑，返回端口；未安装时抛 STT_NOT_INSTALLED（X-ASR 不用这个） */
 export async function sttEnsure(preferredPort = 0, backend?: 'cpu' | 'cuda'): Promise<number> {
   if (!isTauri) throw new Error('浏览器预览环境不支持本地语音服务')
   return invoke<number>('stt_ensure', { preferredPort, backend })
