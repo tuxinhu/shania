@@ -103,12 +103,13 @@ function resize() {
   el.style.height = `${Math.min(el.scrollHeight, 176)}px`
 }
 
-function setDraft(text: string) {
+function setDraft(text: string, caret = text.length) {
   draft.value = text
   nextTick(() => {
     resize()
     focusInput()
-    ta.value?.setSelectionRange(text.length, text.length)
+    // 光标不一定放在末尾：语音在中间插入时，尾巴那截原文得留在光标后面
+    ta.value?.setSelectionRange(caret, caret)
   })
 }
 
@@ -194,14 +195,20 @@ const voiceTitle = computed(() => {
 /**
  * 语音输入期间，输入框里「由声音转出来的那段文字」是整体管理的，不是一段段往后追加。
  *
- *   voiceBase      开始说话前已有的内容（末尾带一个分隔空格）
+ *   voiceHead      开始说话时光标**前面**的既有内容
+ *   voiceTail      光标**后面**的既有内容，原样留在识别文字之后
  *   voiceConfirmed 已经定稿的句子
  *   voicePreview   正在说的这一句的临时结果，随时会被下一次识别改写
  *
  * 为什么必须拆开：识别模型每次吐的都是「从头到现在」的整句，不是增量，
  * 直接往后追加的话同一句话会出现三五遍，所以只能「覆盖预览、定稿才追加」。
+ *
+ * 为什么还要分前后两段：用户把光标点在已有文字的中间说话时，期待的字是插在
+ * 那儿的，而不是整段跑到末尾、把后半句甩在后面。只有开录时光标在末尾，
+ * `voiceTail` 才是空串，行为和「接在后面说」完全一样。
  */
-let voiceBase = ''
+let voiceHead = ''
+let voiceTail = ''
 let voiceConfirmed = ''
 let voicePreview = ''
 
@@ -217,9 +224,11 @@ let voiceCancelled = false
 
 function ensureVoiceAnchor() {
   // 用户一边说话一边自己改输入框（或发了消息）——以他改后的内容为新基准，
-  // 别把他的手打内容覆盖掉
+  // 别把他的手打内容覆盖掉。这时不再分前后两段：光标是他自己挪的，猜不准
+  // 他想插在哪，退回「接在末尾」最不容易出错。
   if (draft.value !== voiceFull()) {
-    voiceBase = draft.value
+    voiceHead = draft.value
+    voiceTail = ''
     voiceConfirmed = ''
     voicePreview = ''
   }
@@ -229,19 +238,30 @@ function ensureVoiceAnchor() {
  * 两段语音之间怎么接。实现在 `lib/punctuate.ts`——中文靠标点断句不要空格，
  * 英文必须补空格，规则比看上去啰嗦。
  */
+function voiceInserted(): string {
+  return joinVoice(voiceConfirmed, voicePreview)
+}
+
 function voiceFull(): string {
-  return voiceBase + joinVoice(voiceConfirmed, voicePreview)
+  return voiceHead + voiceInserted() + voiceTail
 }
 
 function renderVoice() {
-  const next = voiceFull()
-  if (next !== draft.value) setDraft(next)
+  const inserted = voiceInserted()
+  const next = voiceHead + inserted + voiceTail
+  // 光标停在「刚识别出来的字」之后、原文尾巴之前。放在全文末尾的话，用户在
+  // 中间插话时光标会被甩到那段尾巴后面——正是这个让他以为光标乱跳。
+  const caret = voiceHead.length + inserted.length
+  if (next !== draft.value) setDraft(next, caret)
 }
 
-function beginVoiceSession() {
+function beginVoiceSession(caret: number | null) {
+  const text = draft.value
+  const pos = caret === null ? text.length : Math.min(Math.max(caret, 0), text.length)
   // 语音文字直接接在原有内容后面，不额外补空格：中文不需要，英文用户也很少
   // 在已有内容后面接着口述。补了反而在输入框里留一个突兀的尾巴。
-  voiceBase = draft.value
+  voiceHead = text.slice(0, pos)
+  voiceTail = text.slice(pos)
   voiceConfirmed = ''
   voicePreview = ''
 }
@@ -277,7 +297,8 @@ function settleVoice() {
   voicePreview = ''
   voiceConfirmed = closeSession(voiceConfirmed)
   renderVoice()
-  voiceBase = ''
+  voiceHead = ''
+  voiceTail = ''
   voiceConfirmed = ''
 }
 
@@ -289,7 +310,8 @@ function endVoiceSession() {
   // 定稿时一律补「，」（那时不知道还会不会继续说），这里改成句号收尾
   voiceConfirmed = closeSession(voiceConfirmed)
   renderVoice()
-  voiceBase = ''
+  voiceHead = ''
+  voiceTail = ''
   voiceConfirmed = ''
 }
 
@@ -341,6 +363,15 @@ async function startStream(): Promise<boolean> {
 }
 
 async function toggleVoice() {
+  // 先把光标位置记下来，再抢焦点：抢焦点有可能把它重置成末尾（输入框原本
+  // 没聚焦时尤其如此），而「插在哪」正是由它决定的。
+  //
+  // 只在输入框**本来就聚焦**时采信它——那说明光标是用户刚点出来的；没聚焦
+  // 时 `selectionStart` 是个陈旧的残值，按它插会插到莫名其妙的地方，这时
+  // 退回「接在末尾」。
+  const el = ta.value
+  const caretBefore = el && document.activeElement === el ? el.selectionStart : null
+
   // 就在点击这一刻把焦点交回输入框（见 `focusInput` 的说明）。放到后面 await
   // 之后就晚了：打开麦克风那几百毫秒里 webview 可能已经丢了窗口焦点，那时再
   // focus() 只会得到一个看不出效果的光标。开关两个方向都要——结束录音时用户
@@ -385,7 +416,7 @@ async function toggleVoice() {
     // 先把界面切到录音态：start() 里要等麦克风设备打开（200-400ms），
     // 那段时间界面一动不动，用户会以为没点上
     recording.value = true
-    beginVoiceSession()
+    beginVoiceSession(caretBefore)
 
     const started = await startStream()
     // 加载模型这几秒里用户可能已经点了「结束」
