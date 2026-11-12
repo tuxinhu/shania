@@ -72,6 +72,8 @@ WebView2 与托盘。拆开后 CLI 二进制只含 reqwest + serde，Agent 逻�
 - 开机自启（autostart 插件）
 
 ### 设置与交付
+- **设置是整页不是弹窗**：左导航 + 右内容，六个模块——通用 / 模型 / 人设 / 语音 / 工具 / 数据与关于；
+  正文限宽 720px 居中，标题与表单同轴对齐，`Esc` 或右上「完成」返回会话（记住上次停在哪页）
 - 多模型配置 profiles：baseURL / apiKey / 模型名，一键切换 + 连接测试
 - **深色主题**：浅色 / 深色 / 跟随系统，首屏前由内联脚本定主题（不闪白）
 - 语音识别配置：模型状态 + 启动预加载（不需要端口、地址、语言这些参数）
@@ -118,7 +120,7 @@ pnpm stt            # 起旧的 whisper-server（桌面端已不再调用，仅�
 | 模型 | int8 量化，中英双语，自带标点，134MB |
 | 实测 RTF | 0.19–0.24（4 线程） |
 
-设置面板 →「语音输入」只有两块：**模型状态**（未安装 → 下载 134MB → 已就绪/已加载）
+设置页 →「语音输入」只有两块：**模型状态**（未安装 → 下载 134MB → 已就绪/已加载）
 和 **启动时预加载**开关。
 
 #### 实现要点
@@ -328,7 +330,7 @@ shania --show-reasoning "解释一下这段代码"
 
 | 文件 | 谁写 | 作用 |
 |---|---|---|
-| `~/.shania/settings.json` | 桌面端（设置面板改动后自动写） | **共享设置**：baseUrl / apiKey / model / temperature / maxTokens / systemPrompt / toolsEnabled，外加主题、模型预设、快捷键等桌面端专属项 |
+| `~/.shania/settings.json` | 桌面端（设置页改动后自动写） | **共享设置**：baseUrl / apiKey / model / temperature / maxTokens / systemPrompt / toolsEnabled，外加主题、模型预设、快捷键等桌面端专属项 |
 | `~/.shania/sessions/<id>.json` | 桌面端（会话变化时写） | 会话历史，**一个会话一个文件**，temp + rename 原子写入 |
 | `~/.shania/config.json` | 手写（可选） | **CLI 专用覆盖**：只想让命令行指向别的服务时用，不影响桌面端 |
 | `~/.shania/logs/` | 桌面端 + CLI | 运行日志，见下节 |
@@ -427,7 +429,8 @@ src/
   stores/chat.ts      ← 会话/流式状态机（重试/编辑/删除/归档/搜索/草稿）
   stores/settings.ts  ← 设置状态，落盘到 ~/.shania/settings.json（localStorage 仅作首屏缓存）
   components/         ← ChatPanel / MessageItem / ChatComposer / ToolCallCard /
-                        MarkdownView / SidebarPanel / SettingsDialog / EmptyState / Icon
+                        MarkdownView / SidebarPanel / SettingsPage / WindowControls /
+                        EmptyState / Icon
 ```
 
 ## 5. 未完成事项 / 下一步方向

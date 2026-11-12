@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
 import ChatPanel from '@/components/ChatPanel.vue'
-import SettingsDialog from '@/components/SettingsDialog.vue'
+import SettingsPage from '@/components/SettingsPage.vue'
 import SidebarPanel from '@/components/SidebarPanel.vue'
 import {
   applyGlobalShortcut,
@@ -121,9 +121,18 @@ onUnmounted(() => {
 
 <template>
   <div class="shell">
-    <SidebarPanel @open-settings="settingsOpen = true" />
-    <ChatPanel @open-settings="settingsOpen = true" />
-    <SettingsDialog v-model:open="settingsOpen" />
+    <!--
+      会话页用 v-show 而不是 v-if：设置页盖住它时不能把组件拆掉，否则滚动位置、
+      输入框里没保存的草稿、通话浮层的状态全丢了，退出设置还得重新找刚才看到哪儿。
+
+      外面这层 .screen 不能省：SidebarPanel 是「aside + Teleport」两个根节点，
+      v-show 落到多根组件上既不生效也不报错，侧栏会一直留在屏幕上。
+    -->
+    <div v-show="!settingsOpen" class="screen">
+      <SidebarPanel @open-settings="settingsOpen = true" />
+      <ChatPanel @open-settings="settingsOpen = true" />
+    </div>
+    <SettingsPage v-if="settingsOpen" @close="settingsOpen = false" />
   </div>
 </template>
 
@@ -134,5 +143,13 @@ onUnmounted(() => {
   min-height: 100vh;
   overflow: hidden;
   background: var(--bg);
+}
+
+/* 会话页整屏（侧栏 + 主区）。设置页开时整块隐藏，但组件不销毁 */
+.screen {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  height: 100vh;
 }
 </style>
