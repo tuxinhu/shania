@@ -199,6 +199,43 @@ scripts/stt-server.ps1                                    # 手动起服务的�
 | whisper CPU + `-ac 450`（已下线） | 1.4 s | 1.8 s |
 | whisper GPU（已下线） | 0.5 s | 0.3–0.5 s |
 
+#### 语音输出（本地 TTS）
+
+两个模型都是进程内 ONNX（和 X-ASR 共用同一个 `onnxruntime.dll`），不联网、不占显存、
+不需要单独的服务进程：
+
+| 模型 | 磁盘 | 实测合成耗时 | 音色 | 定位 |
+|---|---|---|---|---|
+| `matcha-icefall-zh-baker` | 72MB + 54MB 声码器 | 12 字 132ms、20 字 243ms | 1 个女声 | 默认，中文通话用 |
+| `kokoro-multi-lang-v1_1` | 348MB | 12 字 1290ms、20 字 2420ms | 103 个 | 音质更自然，但中文词表覆盖不足 |
+
+**两个模型都没有英文能力**，差别只在于「哪些词念得出来」：
+
+| | 拉丁字母 | 阿拉伯数字 | 中文 |
+|---|---|---|---|
+| Matcha | lexicon 里 0 个英文词，全部删掉 | 靠 `number.fst` 转中文读法 | 逐字查拼音，覆盖完整 |
+| Kokoro | 保留 17.8 万词英文表里有的（`settings`/`base` 能念），其余的删掉 | 靠 `number-zh.fst` | 按词查注音表，**表里没有的词会退回拼音、念成英文音** |
+
+kokoro 那行是它最要命的缺陷：「好的」「我看了下」这类常用词不在 68036 行词表里，
+会被念成 “how did”、“well, can less”。所以**中文通话一律用 Matcha**，Kokoro 留给
+英文内容或「不在乎个别词念错、只要音色好听」的朗读场景。
+
+英文词的处理逻辑在 `tts.rs` 的 `Latin`：`Drop`（Matcha，整词删）和
+`Allow(HashSet)`（Kokoro，查表保留）。删而不是留着，是因为留着会念出不相干的音——
+实测 “API” 和 “GPT” 都念成 “total”，两个不同的词撞成同一个音，听感上就是「同一个字
+被重读了两遍」。
+
+切换在「设置 → 语音输出 → 合成模型」，三选一：**自动 / Matcha / Kokoro**。
+存进 `settings.json` 的 `ttsModel`，取值 `auto` | `matcha` | `kokoro`：
+
+- `auto`：装了哪个用哪个，Matcha 优先（快）
+- 指定的模型没装 → 自动回退到已装的那个，并且设置页会用红字说明「现在实际在用谁」，
+  不会出现「选了却没声音」
+- 切换时会把内存里的旧模型丢掉，下次合成按新选择重新加载（两个模型同时驻留要多占 350MB）
+
+需要镜像时用 `SHANIA_TTS_URL`（Matcha 包）/ `SHANIA_TTS_VOCODER_URL`（声码器）/
+`SHANIA_TTS_KOKORO_URL`（Kokoro 包）覆盖下载地址。
+
 
 **MCP 工具**：配置文件 `~/.shania/mcp.json`（不存在视为没有 MCP）。
 

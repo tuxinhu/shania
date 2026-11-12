@@ -1,5 +1,5 @@
 import { Channel, invoke } from '@tauri-apps/api/core'
-import type { StreamEvent, WireMessage } from './types'
+import type { StreamEvent, TtsModel, WireMessage } from './types'
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 
@@ -82,7 +82,7 @@ export async function saveSettingsRaw(json: string): Promise<void> {
 }
 
 export interface SttProgress {
-  stage: 'stream' | 'done'
+  stage: 'stream' | 'tts' | 'done'
   done: number
   total: number | null
 }
@@ -110,6 +110,92 @@ export async function sttStreamInstall(): Promise<void> {
 export async function sttStreamUnload(): Promise<void> {
   if (!isTauri) return
   await invoke('stt_stream_unload')
+}
+
+/* ------------------------------------------------------------------ */
+/* 本地语音合成（Kokoro）                                               */
+/* ------------------------------------------------------------------ */
+
+/** 模型没装好：调用方据此提示去设置里下载 */
+export const TTS_NOT_INSTALLED = 'TTS_NOT_INSTALLED'
+
+/** 语音合成模型状态 */
+export interface TtsStatus {
+  ready: boolean
+  bytes: number
+  loaded: boolean
+  dir: string
+  /** 音色总数，0 表示模型未加载 */
+  speakers: number
+  /** 输出采样率，Hz */
+  rate: number
+  /** 当前用的模型（Matcha 单音色 / Kokoro 103 音色），未加载时为空 */
+  kind: string
+  /** 当前生效模型的 id：`matcha` / `kokoro`，都没装时为空 */
+  activeKind: string
+  /** 两个模型各自装没装 */
+  models: TtsModelStatus[]
+}
+
+export interface TtsModelStatus {
+  id: string
+  label: string
+  ready: boolean
+  bytes: number
+  /** 当前是否正在用 */
+  active: boolean
+}
+
+/** 一段合成好的语音：base64 的小端 i16 单声道 PCM */
+export interface Speech {
+  pcm: string
+  rate: number
+  durationMs: number
+}
+
+/**
+ * 模型状态。
+ *
+ * `model` 必须传当前设置值：设置写盘是 250ms 防抖的，后端读文件会拿到旧值，
+ * 表现为「两个模型都装好了却互相说对方没装好」。
+ */
+export async function ttsStatus(model?: TtsModel): Promise<TtsStatus | null> {
+  if (!isTauri) return null
+  return invoke<TtsStatus>('tts_status', { model: model ?? null })
+}
+
+/** 合成一句话。第一次调用会按需加载模型（0.3-2.5 秒） */
+export async function ttsSay(
+  text: string,
+  sid: number,
+  speed: number,
+  model?: TtsModel,
+): Promise<Speech> {
+  if (!isTauri) throw new Error('浏览器预览环境没有本地语音合成')
+  return invoke<Speech>('tts_say', { text, sid, speed, model: model ?? null })
+}
+
+/** 提前加载合成器，避免通话第一句等 1-2 秒 */
+export async function ttsWarmup(model?: TtsModel): Promise<void> {
+  if (!isTauri) return
+  await invoke('tts_warmup', { model: model ?? null })
+}
+
+/** 卸载合成器，释放约 350MB 内存 */
+export async function ttsUnload(): Promise<void> {
+  if (!isTauri) return
+  await invoke('tts_unload')
+}
+
+/**
+ * 下载语音合成模型。`kind` 省略时按设置里选的来。
+ * matcha 约 126MB（模型包 + 单独发布的声码器），kokoro 约 348MB。
+ * 进度走 stt-progress，stage 为 tts。
+ */
+export async function ttsInstall(kind?: 'matcha' | 'kokoro'): Promise<void> {
+  if (!isTauri) throw new Error('浏览器预览环境不支持安装语音模型')
+  // 显式传 null 而不是省略：Rust 侧是 Option<String>，缺参数在旧版本 Tauri 上会报错
+  await invoke('tts_install', { kind: kind ?? null })
 }
 
 /** 打开 `~/.shania/logs/`，排查问题时用 */

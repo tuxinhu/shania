@@ -4,6 +4,7 @@ import ChatComposer from './ChatComposer.vue'
 import EmptyState from './EmptyState.vue'
 import Icon from './Icon.vue'
 import MessageItem from './MessageItem.vue'
+import VoiceCall from './VoiceCall.vue'
 import { useChatStore } from '@/stores/chat'
 import { useSettingsStore } from '@/stores/settings'
 
@@ -15,6 +16,8 @@ const settingsStore = useSettingsStore()
 const composer = ref<InstanceType<typeof ChatComposer> | null>(null)
 const scroller = ref<HTMLElement | null>(null)
 const stick = ref(true)
+/** 通话浮层开关。组件挂载即接通、卸载即挂断，没有第三种状态 */
+const callOpen = ref(false)
 
 const title = computed(() => chat.current?.title || '新对话')
 const isEmpty = computed(() => chat.messages.length === 0)
@@ -131,7 +134,13 @@ function pick(text: string) {
       </div>
     </div>
 
-    <ChatComposer ref="composer" @open-settings="$emit('open-settings')" />
+    <ChatComposer
+      ref="composer"
+      @open-settings="$emit('open-settings')"
+      @start-call="callOpen = true"
+    />
+
+    <VoiceCall v-if="callOpen" @close="callOpen = false" />
   </main>
 </template>
 

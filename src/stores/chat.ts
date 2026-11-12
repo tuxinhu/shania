@@ -441,6 +441,45 @@ export const useChatStore = defineStore('chat', () => {
     return { added, skipped }
   }
 
+  /**
+   * 通话结束一轮：把用户说的话和模型**实际说出口**的回答落库。
+   *
+   * 刻意不复用 `send()`：那边会调 `runCompletion` 重新请求一遍模型，
+   * 而通话的回答在播放时就已经生成好了。`assistant` 传的是截断后的内容
+   * （被打断时用户没听到的部分不该进上下文，否则下一轮模型以为自己说过了）。
+   */
+  function appendTurn(user: string, assistant: string) {
+    const u = user.trim()
+    if (!u) return
+
+    const s = ensureSession()
+    const now = Date.now()
+    s.messages.push({
+      id: uid(),
+      role: 'user',
+      content: u,
+      createdAt: now,
+      status: 'done',
+    })
+
+    const a = assistant.trim()
+    if (a) {
+      s.messages.push({
+        id: uid(),
+        role: 'assistant',
+        content: a,
+        createdAt: now + 1,
+        status: 'done',
+        model: settingsStore.settings.model,
+      })
+    }
+
+    s.updatedAt = now
+    if (s.title === '新对话') {
+      s.title = u.replace(/\s+/g, ' ').slice(0, 28)
+    }
+  }
+
   async function stop() {    if (!streaming.value || !activeRequestId.value) return
     const bot = [...messages.value].reverse().find((m) => m.status === 'streaming')
     if (bot) bot.status = 'stopped'
@@ -474,6 +513,7 @@ export const useChatStore = defineStore('chat', () => {
     jumpToMessage,
     send,
     stop,
+    appendTurn,
     regenerate,
     retry,
     editAndResend,

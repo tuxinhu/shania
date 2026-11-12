@@ -15,7 +15,13 @@ import {
   sttStreamStatus,
   sttStreamUnload,
   testConnection,
+  ttsInstall,
+  ttsSay,
+  ttsStatus,
+  ttsUnload,
+  ttsWarmup,
   type StreamStatus,
+  type TtsStatus,
 } from '@/lib/api'
 import { acceleratorFromEvent, formatShortcut } from '@/lib/shortcut'
 import { useChatStore } from '@/stores/chat'
@@ -339,15 +345,202 @@ async function toggleSttPreload() {
   settingsStore.settings.sttPreload = !settingsStore.settings.sttPreload
 }
 
+/* ---------- 语音输出 ---------- */
+
+const tts = ref<TtsStatus | null>(null)
+/** 正在下载的模型 id，空表示没有下载任务 */
+const ttsInstalling = ref('')
+/** 正在切换模型（Kokoro 要读 348MB，2-3 秒） */
+const ttsSwitching = ref(false)
+const ttsTesting = ref(false)
+const ttsError = ref('')
+const ttsProgress = ref<{ stage: string; done: number; total: number | null }>({
+  stage: '',
+  done: 0,
+  total: null,
+})
+
+/** 设置里选的那个模型：auto 时显示后端实际挑中的 */
+const chosenModel = computed(() => settingsStore.settings.ttsModel)
+const activeKind = computed(() => tts.value?.activeKind ?? '')
+const ttsReady = computed(() => !!tts.value?.ready)
+
+const modelRow = (id: string) => tts.value?.models.find((m) => m.id === id)
+const modelReady = (id: string) => !!modelRow(id)?.ready
+const modelBytes = (id: string) => Math.round((modelRow(id)?.bytes ?? 0) / 1024 / 1024)
+
+/** 音色总数只有加载模型之后才知道；matcha 只有 1 个 */
+const speakerCount = computed(() => (activeKind.value === 'kokoro' ? (tts.value?.speakers ?? 0) : 0))
+
+/**
+ * 选了某个模型但它没装好——只看「装没装」，不看后端当前加载的是谁。
+ *
+ * 之前拿 `activeKind !== 设置值` 判断是错的：刚点完切换时后端还加载着旧模型
+ * （或者设置还没落盘），两边永远不一致，于是不管选哪个都提示「没装好」。
+ */
+const fellBack = computed(() => {
+  const want = chosenModel.value
+  if (want === 'auto') return false
+  return !modelReady(want)
+})
+
+const ttsPercent = computed(() => {
+  const { done, total } = ttsProgress.value
+  if (!total) return done > 0 ? 100 : 0
+  return Math.min(100, Math.round((done / total) * 100))
+})
+
+const ttsStateText = computed(() => {
+  if (!tts.value) return '浏览器预览环境不可用'
+  if (!tts.value.ready) {
+    // 一个模型都不完整：这时只能报总占用，用来提示「下了一半」
+    const total = Math.round(tts.value.bytes / 1024 / 1024)
+    return total > 0 ? `下载未完成（${total}MB）` : '未安装'
+  }
+  // 只报当前生效那个模型的体积：两个加起来（138+406MB）会让人以为程序很占地方
+  const active = tts.value.models.find((m) => m.active)
+  const mb = Math.round((active?.bytes ?? 0) / 1024 / 1024)
+  const name = activeKind.value === 'kokoro' ? 'Kokoro' : 'Matcha'
+  return tts.value.loaded
+    ? `运行中：${name}（${mb}MB，${tts.value.speakers} 音色）`
+    : `将使用：${name}（${mb}MB），用到时加载`
+})
+
+async function refreshTts() {
+  // 显式带当前设置：后端读 settings.json 有 250ms 防抖窗口，刚切换过来会读到旧值
+  tts.value = await ttsStatus(settingsStore.settings.ttsModel).catch(() => null)
+}
+
+/**
+ * 换模型。
+ *
+ * 已经加载进内存的旧模型必须丢掉：否则 `tts_say` 里那句「已加载且种类相同
+ * 就直接用」会让切换看起来没生效，用户得重启程序才发现。
+ */
+// 已经加载进内存的旧模型必须丢掉：否则 `tts_say` 里那句「已加载且种类相同
+// 就直接用」会让切换看起来没生效，用户得重启程序才发现。
+async function switchModel(id: 'auto' | 'matcha' | 'kokoro') {
+  if (settingsStore.settings.ttsModel === id || ttsSwitching.value) return
+  settingsStore.settings.ttsModel = id
+  ttsError.value = ''
+  ttsSwitching.value = true
+  try {
+    await ttsUnload().catch(() => undefined)
+    // Kokoro 有 103 个音色，只有加载完才知道数量——切过去时顺手读进来，
+    // 否则下面的音色网格要等第一次合成完才出现
+    if (id === 'kokoro' && modelReady('kokoro')) {
+      await ttsWarmup('kokoro').catch(() => undefined)
+    }
+    await refreshTts()
+  } finally {
+    ttsSwitching.value = false
+  }
+}
+
+async function installTts(kind: 'matcha' | 'kokoro') {
+  if (ttsInstalling.value) return
+  const firstOne = !tts.value?.ready
+  ttsInstalling.value = kind
+  ttsError.value = ''
+  try {
+    await ttsInstall(kind)
+    // 之前一个模型都没有：下完直接指过去，免得「下完了还是没声音」
+    if (firstOne) await switchModel(kind)
+  } catch (err) {
+    ttsError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    ttsInstalling.value = ''
+    ttsProgress.value = { stage: '', done: 0, total: null }
+    await refreshTts()
+  }
+}
+
+async function unloadTts() {
+  await ttsUnload().catch(() => undefined)
+  await refreshTts()
+}
+
+/** 试听用的独立上下文：不开麦克风、不碰通话引擎，用完就让浏览器回收 */
+let previewCtx: AudioContext | null = null
+
+/**
+ * 试听文本。
+ *
+ * 挑了一段同时包含数字、日期、中英混排的话——这三样是最容易读错的地方，
+ * 只念「你好」听不出模型好坏。
+ */
+const VOICE_SAMPLE = '你好，我是 Shania。今天是 11 月 12 号，下午三点提醒你开会。'
+
+/**
+ * 试听某个音色（不传则用当前设置的编号）。
+ *
+ * 顺带承担「加载模型」的作用：`tts_say` 内部会先 start 再合成，
+ * 所以第一次点试听会等 1-2 秒（Kokoro 更久），之后视模型而定。
+ */
+async function previewVoice(sid?: number) {
+  // 编号先落：合成 1 秒多的过程中点了别的编号，选中高亮至少要跟着走，
+  // 否则用户会以为点击没被接收
+  if (sid !== undefined) settingsStore.settings.ttsSid = sid
+  if (ttsTesting.value) return
+  ttsTesting.value = true
+  ttsError.value = ''
+
+  // 「重听」按钮不传 sid，用当前选中的编号
+  const voice = sid ?? settingsStore.settings.ttsSid
+
+  try {
+    const speech = await ttsSay(
+      VOICE_SAMPLE,
+      voice,
+      settingsStore.settings.ttsSpeed,
+      settingsStore.settings.ttsModel,
+    )
+
+    const binary = atob(speech.pcm)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+    const pcm = new Int16Array(bytes.buffer, 0, bytes.length >> 1)
+    const samples = new Float32Array(pcm.length)
+    for (let i = 0; i < pcm.length; i += 1) samples[i] = pcm[i] / 32768
+
+    const ctx = previewCtx ?? new AudioContext()
+    previewCtx = ctx
+    if (ctx.state === 'suspended') await ctx.resume()
+
+    const buffer = ctx.createBuffer(1, samples.length, speech.rate)
+    buffer.getChannelData(0).set(samples)
+    const source = ctx.createBufferSource()
+    source.buffer = buffer
+    source.connect(ctx.destination)
+    source.start()
+
+    // 模型刚加载完，音色总数这时才拿得到
+    await refreshTts()
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    ttsError.value = msg.includes('TTS_NOT_INSTALLED')
+      ? '语音合成模型还没下载，先点上面的「下载语音模型」'
+      : `试听失败：${msg}`
+  } finally {
+    ttsTesting.value = false
+  }
+}
+
 onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
   autoStart.value = await isAutoStartEnabled().catch(() => false)
   await refreshStt()
+  await refreshTts()
   if (isTauri) {
     unlistenStt = await listen<{ stage: string; done: number; total: number | null }>(
       'stt-progress',
       (event) => {
-        sttProgress.value = event.payload
+        // 两个模型共用一个事件通道，靠 stage 分派，别让 TTS 的进度刷掉 STT 的
+        if (event.payload.stage === 'tts') {
+          ttsProgress.value = event.payload
+        } else {
+          sttProgress.value = event.payload
+        }
       },
     )
   }
@@ -588,6 +781,211 @@ onUnmounted(() => {
                       <span class="knob" />
                     </button>
                   </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- 语音输出 -->
+            <section>
+              <div class="section-title">语音输出</div>
+              <div class="group">
+                <div class="field">
+                  <div class="stt-head">
+                    <span>合成模型</span>
+                    <span class="stt-state" :class="{ ok: ttsReady, warn: !!tts && !ttsReady }">
+                      {{ ttsStateText }}
+                    </span>
+                  </div>
+
+                  <div class="tts-pick">
+                    <button
+                      class="tts-opt"
+                      :class="{ on: chosenModel === 'auto' }"
+                      :disabled="ttsSwitching"
+                      @click="switchModel('auto')"
+                    >
+                      <span class="tts-opt-name">自动</span>
+                      <span class="tts-opt-desc">装了哪个用哪个，Matcha 优先</span>
+                    </button>
+                    <button
+                      class="tts-opt"
+                      :class="{ on: chosenModel === 'matcha' }"
+                      :disabled="ttsSwitching"
+                      @click="switchModel('matcha')"
+                    >
+                      <span class="tts-opt-name">Matcha</span>
+                      <span class="tts-opt-desc">快，单音色 · 中文最稳 · RTF 0.06</span>
+                    </button>
+                    <button
+                      class="tts-opt"
+                      :class="{ on: chosenModel === 'kokoro' }"
+                      :disabled="ttsSwitching"
+                      @click="switchModel('kokoro')"
+                    >
+                      <span class="tts-opt-name">Kokoro</span>
+                      <span class="tts-opt-desc">慢，103 音色 · 中文有个别词会念错 · RTF 0.5</span>
+                    </button>
+                  </div>
+
+                  <p v-if="chosenModel === 'kokoro'" class="tts-warn">
+                    Kokoro 的中文词表覆盖不如 Matcha：像「好的」「我看了下」这类常用词不在词表里，
+                    会被按拼音念成英文音（听起来像重复或念错）。要念中文通话，建议用 Matcha。
+                  </p>
+
+                  <p v-if="ttsSwitching" class="help">正在切模型，读模型文件要 2-3 秒…</p>
+
+                  <p v-if="fellBack" class="tts-error">
+                    选的是 {{ chosenModel === 'kokoro' ? 'Kokoro' : 'Matcha' }}，但它的模型文件不完整，
+                    现在{{ ttsReady ? `用 ${activeKind === 'kokoro' ? 'Kokoro' : 'Matcha'} 顶着` : '完全没法合成' }}。
+                    点下面那一行的「下载」补全后会自动切过去。
+                  </p>
+                </div>
+
+                <!-- 两个模型的下载/卸载各自独立：换模型不该逼用户重下已有的 -->
+                <div
+                  v-for="m in [
+                    { id: 'matcha', name: 'Matcha zh-baker', size: '约 126MB', note: '模型包 72MB + 声码器 54MB' },
+                    { id: 'kokoro', name: 'Kokoro multi-lang v1.1', size: '约 348MB', note: '中英混排，103 个音色' },
+                  ]"
+                  :key="m.id"
+                  class="field"
+                >
+                  <div class="stt-head">
+                    <span>{{ m.name }}</span>
+                    <span class="stt-state" :class="{ ok: modelReady(m.id) }">
+                      {{
+                        modelReady(m.id)
+                          ? `${modelBytes(m.id)}MB · 已安装`
+                          : ttsInstalling === m.id
+                            ? '下载中…'
+                            : '未安装'
+                      }}
+                    </span>
+                  </div>
+
+                  <div class="stt-actions">
+                    <button
+                      v-if="!modelReady(m.id)"
+                      class="mini-btn primary"
+                      :disabled="!!ttsInstalling"
+                      @click="installTts(m.id as 'matcha' | 'kokoro')"
+                    >
+                      {{ ttsInstalling === m.id ? '下载中…' : `下载（${m.size}）` }}
+                    </button>
+                    <span class="row-sub" style="flex: 1">{{ m.note }}</span>
+                  </div>
+
+                  <div v-if="ttsInstalling === m.id" class="stt-progress">
+                    <div class="stt-bar"><i :style="{ width: `${ttsPercent}%` }" /></div>
+                    <span>下载中 {{ ttsPercent }}%</span>
+                  </div>
+                </div>
+
+                <div class="field">
+                  <div class="stt-actions">
+                    <button
+                      v-if="tts?.loaded"
+                      class="mini-btn"
+                      title="释放内存，下次合成时再重新加载"
+                      @click="unloadTts"
+                    >
+                      卸载内存中的模型
+                    </button>
+                    <span v-if="tts?.dir" class="stt-dir" :title="tts.dir">~/.shania/models/…</span>
+                  </div>
+                  <p v-if="ttsError" class="stt-error">{{ ttsError }}</p>
+                  <p class="help">
+                    两个模型都在<strong>本进程内</strong>合成：不联网、不占显存、不需要单独的服务进程。
+                    <br />
+                    <strong>Matcha</strong> 实测 8 字 109ms，通话延迟预算里最省的一环，但它只有一个女声。
+                    <br />
+                    <strong>Kokoro</strong> 音色明显更自然，可是 RTF 是 0.5——一句 8 字要 960ms，
+                    通话首声会拖到 1.8 秒。想听它念长文可以选，做通话不推荐。
+                  </p>
+                </div>
+
+                <!-- Kokoro 有 103 个音色，滑块挨个拖 + 点试听要几十分钟，
+                     这里直接铺成编号网格：点一下即选定并朗读 -->
+                <div v-if="speakerCount > 0" class="field">
+                  <div class="stt-head">
+                    <span>音色</span>
+                    <span class="stt-state">
+                      {{ settingsStore.settings.ttsSid }} 号 · 共 {{ speakerCount }}
+                    </span>
+                  </div>
+                  <div class="voice-grid">
+                    <button
+                      v-for="i in speakerCount"
+                      :key="i - 1"
+                      class="voice-dot"
+                      :class="{ on: settingsStore.settings.ttsSid === i - 1 }"
+                      :title="`${i - 1} 号`"
+                      @click="previewVoice(i - 1)"
+                    >
+                      {{ i - 1 }}
+                    </button>
+                  </div>
+                  <div class="tts-row">
+                    <button
+                      class="mini-btn"
+                      :disabled="ttsTesting"
+                      @click="previewVoice(settingsStore.settings.ttsSid)"
+                    >
+                      {{ ttsTesting ? '合成中…' : `重听 ${settingsStore.settings.ttsSid} 号` }}
+                    </button>
+                    <button
+                      class="mini-btn"
+                      :disabled="ttsTesting"
+                      title="按顺序听下一个"
+                      @click="previewVoice((settingsStore.settings.ttsSid + 1) % speakerCount)"
+                    >
+                      下一个
+                    </button>
+                    <span class="row-sub" style="flex: 1">
+                      点编号即选定并朗读。103 个里约 55 个中文女声、45 个中文男声、3 个英文，
+                      具体哪个编号对应哪种由模型打包顺序决定，点一下就能听出来。
+                    </span>
+                  </div>
+                </div>
+
+                <div v-else class="field">
+                  <div class="stt-head">
+                    <span>音色</span>
+                    <span class="stt-state">
+                      {{
+                        !ttsReady
+                          ? '需先下载模型'
+                          : activeKind === 'kokoro'
+                            ? '模型加载后可调'
+                            : '单音色（女声）'
+                      }}
+                    </span>
+                  </div>
+                  <div class="tts-row">
+                    <span class="row-sub" style="flex: 1">
+                      现在用的是 Matcha，只有一个人声（Baker 数据集），没有可选的音色。
+                      想要 103 个音色：把上面的「合成模型」改成 <strong>Kokoro</strong>，
+                      下载完这里会变成编号网格，点一下就能试听。代价是 RTF 0.5，通话首声约 1.8 秒。
+                    </span>
+                    <button class="mini-btn" :disabled="!ttsReady || ttsTesting" @click="previewVoice()">
+                      {{ ttsTesting ? '合成中…' : '试听' }}
+                    </button>
+                  </div>
+                </div>
+
+                <div class="field last">
+                  <div class="stt-head">
+                    <span>语速</span>
+                    <span class="stt-state">{{ settingsStore.settings.ttsSpeed.toFixed(2) }}×</span>
+                  </div>
+                  <input
+                    v-model.number="settingsStore.settings.ttsSpeed"
+                    type="range"
+                    min="0.6"
+                    max="1.6"
+                    step="0.05"
+                  />
+                  <p class="help">通话建议 1.0。超过 1.3 会明显变调、发闷。</p>
                 </div>
               </div>
             </section>
@@ -1048,6 +1446,111 @@ section {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+/* 音色：滑块占满剩余宽度，试听按钮固定宽度 */
+.tts-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+/* 合成相关的提示：错误红、限制说明琥珀，和「正常运行」的灰字区分开 */
+.tts-error,
+.tts-warn {
+  margin: 2px 0 0;
+  font-size: 12px;
+  line-height: 1.65;
+}
+.tts-error {
+  color: var(--danger, #d24b4b);
+}
+.tts-warn {
+  color: #c2410c;
+  background: rgba(217, 119, 6, 0.08);
+  border: 1px solid rgba(217, 119, 6, 0.22);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+/* 三选一的模型卡：一行一个，选中状态一眼能看出来 */
+.tts-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tts-opt {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.14s var(--ease), background 0.14s var(--ease);
+}
+.tts-opt:hover {
+  background: var(--hover);
+}
+.tts-opt:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.tts-opt.on {
+  border-color: var(--accent);
+  background: var(--accent-soft, rgba(10, 111, 240, 0.1));
+}
+.tts-opt-name {
+  font-weight: 600;
+  flex-shrink: 0;
+  min-width: 62px;
+}
+.tts-opt.on .tts-opt-name {
+  color: var(--accent);
+}
+.tts-opt-desc {
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.4;
+}
+/* 音色编号网格：103 个编号用滑块挨个试太慢，直接铺开点。
+   最多 9 行，超出滚动，不会把设置面板撑爆 */
+.voice-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-height: 168px;
+  overflow-y: auto;
+  padding: 2px;
+}
+.voice-dot {
+  min-width: 29px;
+  height: 24px;
+  padding: 0 4px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-2, var(--text));
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background 0.12s var(--ease), border-color 0.12s var(--ease);
+}
+.voice-dot:hover {
+  background: var(--hover);
+}
+.voice-dot.on {
+  border-color: var(--accent);
+  background: var(--accent-soft, rgba(10, 111, 240, 0.14));
+  color: var(--accent);
+  font-weight: 600;
+}
+.tts-row input[type='range'] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
 }
 /* CPU / GPU 二选一：分段按钮比下拉框更直观，也省一次展开 */
 .seg-group {

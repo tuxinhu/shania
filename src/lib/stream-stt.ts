@@ -84,14 +84,31 @@ export class StreamStt {
    * 打开一个会话。模型未安装时抛 `STREAM_NOT_INSTALLED`。
    *
    * 第一次调用会加载 134MB 模型（1-2 秒），之后常驻，stop 之后再次 start 是毫秒级。
+   *
+   * `silence` 是断句阈值（秒）：聊天输入省缺 0.9，通话传 0.5。换阈值会重建识别器
+   * （1-2 秒），所以同一个功能内不要来回改。
    */
-  async start(): Promise<void> {
+  async start(silence?: number): Promise<void> {
     if (this.active) return
     this.id = randomId()
-    await invoke('stt_stream_start', { sessionId: this.id })
+    await invoke('stt_stream_start', { sessionId: this.id, silence })
     this.active = true
     this.queue = Promise.resolve()
     this.pending = 0
+  }
+
+  /**
+   * 打断后重开：把被模型自己声音污染的半句扔掉，重新开始听。
+   *
+   * 全双工里这是必须的——插话那一刻麦克风里混着 TTS 的残余回声，
+   * 直接接着解会把「你好」听成「好哦」之类。重开只丢插话的头一两个字。
+   */
+  async restart(silence?: number): Promise<void> {
+    this.active = false
+    this.id = ''
+    this.pending = 0
+    this.queue = Promise.resolve()
+    await this.start(silence)
   }
 
   /**

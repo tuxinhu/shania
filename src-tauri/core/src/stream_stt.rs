@@ -228,10 +228,23 @@ struct Session {
     /// partial 无限长、前端每次都要重绘一大段。
     utterance_ms: u32,
     last_partial: String,
+    /// 建这个 stream 时用的 rule2 值。改了参数必须重建 recognizer，
+    /// 不能只改字段——endpoint 规则是创建时烤进 C++ 对象的。
+    silence: f32,
 }
 
 /// 一句最长多久。超过就硬断，把当前 partial 当句末交出去。
 const MAX_UTTERANCE_MS: u32 = 15_000;
+
+/// 聊天输入的断句阈值（秒）。能吃掉换气停顿，用户也不急着要结果。
+pub const CHAT_SILENCE: f32 = 0.9;
+
+/// 通话的断句阈值（秒）。
+///
+/// 通话里说话人一停就在等回答，0.9 秒的空等会被明确感知成「它卡住了」。
+/// 也不能压到 0.3 以下：中文的句内换气就有 0.2-0.4 秒，切太碎会把一句话
+/// 断成三段，模型每段都当成完整问题回答。
+pub const CALL_SILENCE: f32 = 0.5;
 
 /// 识别器常驻容器。
 ///
@@ -259,15 +272,36 @@ impl Engine {
     }
 
     /// 创建识别器 + 一个新 stream。已经加载过就直接重置，不再读盘。
+    ///
+    /// 用聊天输入的默认断句阈值（0.9s）。通话场景要 short 一些，见 [`Engine::start_with`]。
     pub fn start(&self, root: &Path) -> Result<(), String> {
+        self.start_with(root, CHAT_SILENCE)
+    }
+
+    /// 指定 rule2 启动。
+    ///
+    /// `silence` 是「已经解出字之后，尾部静音多久算说完」。
+    ///
+    /// 聊天输入用 [`CHAT_SILENCE`]（0.9s）：能吃掉换气停顿，用户也不急着要结果。
+    /// 通话要用 [`CALL_SILENCE`]（0.5s）：说话人一停就在等回答，0.9 秒的空等
+    /// 会被明确感知成「它卡住了」。
+    ///
+    /// 注意参数变了只能**重建** recognizer——endpoint 规则在创建时就烤进 C++ 对象了，
+    /// 改字段没用。重建约 1-2 秒，但只在聊天/通话互相切换时发生一次。
+    pub fn start_with(&self, root: &Path, silence: f32) -> Result<(), String> {
+        let silence = silence.clamp(0.2, 3.0);
         let mut guard = self.inner.lock().map_err(|_| "识别器状态锁失效".to_string())?;
 
         if let Some(session) = guard.as_mut() {
-            // 复用：把上一轮没说完的残句清掉，换个干净的 stream 状态
-            session.recognizer.reset(&session.stream);
-            session.last_partial.clear();
-            session.utterance_ms = 0;
-            return Ok(());
+            if (session.silence - silence).abs() < 1e-3 {
+                // 复用：把上一轮没说完的残句清掉，换个干净的 stream 状态
+                session.recognizer.reset(&session.stream);
+                session.last_partial.clear();
+                session.utterance_ms = 0;
+                return Ok(());
+            }
+            // 阈值不同，只能重建
+            *guard = None;
         }
 
         let files = files(root).ok_or_else(|| "流式识别模型还没装好".to_string())?;
@@ -294,7 +328,7 @@ impl Engine {
             rule1_min_trailing_silence: 2.4,
             // rule2：已经解出字之后，尾部静音多久算说完。中文说话的换气停顿一般
             // 0.3-0.5 秒，0.9 秒能吃掉换气、又不会让一句说完等太久。
-            rule2_min_trailing_silence: 0.9,
+            rule2_min_trailing_silence: silence,
             // rule3：单句硬上限（秒）
             rule3_min_utterance_length: 20.0,
             ..Default::default()
@@ -319,6 +353,7 @@ impl Engine {
             stream,
             utterance_ms: 0,
             last_partial: String::new(),
+            silence,
         });
         Ok(())
     }

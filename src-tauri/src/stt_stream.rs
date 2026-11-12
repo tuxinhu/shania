@@ -53,11 +53,15 @@ fn root_dir() -> Result<std::path::PathBuf, String> {
 
 /// 开始一次识别会话。模型已加载时只是重置 stream，不读盘。
 ///
+/// `silence` 是断句阈值（秒），省略时用聊天输入的 0.9；通话传 0.5。
+/// 阈值变了会重建识别器（1-2 秒），所以同一个功能内别来回改。
+///
 /// 必须是 async + spawn_blocking：同步命令在 Tauri 里跑在**主线程**上，
 /// 首次加载模型要 2-5 秒，直接写同步会把整个界面冻住。
 #[tauri::command]
 pub async fn stt_stream_start(
     session_id: String,
+    silence: Option<f32>,
     state: State<'_, StreamState>,
 ) -> Result<(), String> {
     let root = root_dir()?;
@@ -71,7 +75,8 @@ pub async fn stt_stream_start(
     }
 
     let engine = state.engine.clone();
-    tauri::async_runtime::spawn_blocking(move || engine.start(&root))
+    let silence = silence.unwrap_or(stream_stt::CHAT_SILENCE);
+    tauri::async_runtime::spawn_blocking(move || engine.start_with(&root, silence))
         .await
         .map_err(|e| format!("启动识别器失败：{e}"))??;
 
@@ -283,7 +288,10 @@ pub fn preload(app: &AppHandle) {
 
 /// 「启动时预加载」开关。缺字段按开处理——老设置文件里没有这一项，
 /// 而它的默认行为一直是开机就加载。
-fn preload_enabled() -> bool {
+///
+/// 语音合成也读这个开关：对用户来说都是「把语音模型读进内存」，
+/// 拆成两个只会让人困惑。
+pub(crate) fn preload_enabled() -> bool {
     let Ok(Some(raw)) = crate::settings::load_settings() else {
         return true;
     };

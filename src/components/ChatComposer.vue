@@ -11,7 +11,7 @@ import { useChatStore } from '@/stores/chat'
 import { useSettingsStore } from '@/stores/settings'
 import type { Attachment } from '@/lib/types'
 
-defineEmits<{ (e: 'open-settings'): void }>()
+defineEmits<{ (e: 'open-settings'): void; (e: 'start-call'): void }>()
 
 const chat = useChatStore()
 const settingsStore = useSettingsStore()
@@ -611,6 +611,15 @@ defineExpose({ setDraft, focus })
             <span v-if="pendingSegments > 0" class="seg-badge">{{ pendingSegments }}</span>
           </button>
 
+          <button
+            class="chip icon"
+            :disabled="chat.streaming"
+            :title="chat.streaming ? '正在生成回复，先等这一轮结束' : '语音通话（接通后直接说话）'"
+            @click="$emit('start-call')"
+          >
+            <Icon name="phone" :size="13" />
+          </button>
+
           <button class="chip" :class="{ active: settingsStore.settings.toolsEnabled }" @click="toggleTools">
             <Icon name="tool" :size="12" />
             <span>工具{{ settingsStore.settings.toolsEnabled ? '已开' : '已关' }}</span>
@@ -843,6 +852,14 @@ textarea::placeholder {
 .chip:hover {
   background: var(--hover);
   color: var(--text);
+}
+.chip:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.chip:disabled:hover {
+  background: transparent;
+  color: inherit;
 }
 .chip.active {
   color: var(--accent);

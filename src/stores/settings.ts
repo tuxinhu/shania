@@ -25,6 +25,9 @@ const DEFAULTS: AppSettings = {
   autoStart: false,
   contextLimit: 32000,
   sttPreload: true,
+  ttsSid: 0,
+  ttsSpeed: 1,
+  ttsModel: 'auto',
   profiles: [],
   activeProfileId: '',
 }

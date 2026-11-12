@@ -5,6 +5,7 @@ mod settings;
 mod stt_stream;
 mod storage;
 mod tools;
+mod tts_cmd;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -363,6 +364,7 @@ pub fn run() {
         .manage(UiPrefs::default())
         .manage(TrayMenuState::default())
         .manage(stt_stream::StreamState::default())
+        .manage(tts_cmd::TtsState::default())
         .invoke_handler(tauri::generate_handler![
             chat::chat_stream,
             chat::stop_chat,
@@ -380,6 +382,11 @@ pub fn run() {
             stt_stream::stt_stream_install,
             stt_stream::stt_stream_unload,
             stt_stream::stt_stream_status,
+            tts_cmd::tts_say,
+            tts_cmd::tts_status,
+            tts_cmd::tts_install,
+            tts_cmd::tts_unload,
+            tts_cmd::tts_warmup,
             set_global_shortcut,
             set_close_action,
             cli_args::take_cli_args,
@@ -414,6 +421,8 @@ pub fn run() {
             // 识别模型在后台预热（加载要几秒），不阻塞窗口显示。
             // 设置里关掉「启动时预加载」就退回按需加载。
             stt_stream::preload(handle);
+            // 合成器同理：348MB 模型读盘更慢，晚一点起，别跟窗口绘制抢 CPU
+            tts_cmd::preload(handle);
 
             // 首启带参数时前端还没加载，先存着，等它挂载后主动来取。
             // 这里不能 emit——WebView 里的 JS 还不存在，事件会直接丢掉。
