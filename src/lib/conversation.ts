@@ -117,9 +117,49 @@ const NEXT_HARD = 34
 
 /** 有没有能念出来的字。纯标点（「……」「——」）送进合成器只会白跑一趟 */
 const SPEAKABLE = /[\p{L}\p{N}]/u
+/** 单字能不能念。长度预算按这个算，不按原始字符算 */
+const COUNTABLE = /[\p{L}\p{N}]/u
 
 function speakable(text: string): boolean {
   return SPEAKABLE.test(text)
+}
+
+/**
+ * 这些区间「念不出来」，长度预算必须跳过。
+ *
+ * 预算如果按原始字符算，`我看了 \`I:/project/agent-ui\` 的结构` 会被当成 33 个字
+ * 切走，可合成出来只剩「我看了 的结构」6 个字——一段 1 秒的音频后面跟一大截
+ * 静音，听起来就是「卡一下」。表格行同理：它整行不念，却把后面的正文顶出了
+ * 窗口，于是正文被切成「主要分三层：」这种 6 字碎片。
+ *
+ * 判据和 `sanitize` 保持一致：含斜杠、长度 ≥4 的 ASCII token 当路径整段丢掉。
+ */
+function silentRanges(buf: string, end: number): Array<[number, number]> {
+  const out: Array<[number, number]> = []
+
+  // 路径 / URL
+  let s = -1
+  for (let i = 0; i < end; i += 1) {
+    const tokenish = /[A-Za-z0-9._:/\\~-]/.test(buf[i])
+    if (tokenish && s < 0) s = i
+    if (!tokenish && s >= 0) {
+      const tok = buf.slice(s, i)
+      if (/[/\\]/.test(tok) && tok.length >= 4) out.push([s, i])
+      s = -1
+    }
+  }
+  if (s >= 0) {
+    const tok = buf.slice(s, end)
+    if (/[/\\]/.test(tok) && tok.length >= 4) out.push([s, end])
+  }
+
+  // 表格行（含分隔行）
+  for (const m of buf.slice(0, end).matchAll(/^[ \t]*\|.*$/gm)) {
+    const at = m.index ?? 0
+    out.push([at, at + m[0].length])
+  }
+
+  return out.sort((a, b) => a[0] - b[0])
 }
 
 /**
@@ -251,59 +291,95 @@ class Splitter {
     // 而围栏一翻转状态，跟着它的正文就被当成块内容丢掉了
     if (buf.startsWith('```')) return 3
 
+    // 块内的代码整段切走：它一个字都不念，更不该占用长度预算
+    if (this.inFence) {
+      const end = buf.indexOf('```')
+      return end >= 0 ? end + 3 : -1
+    }
+
     const fence = buf.indexOf('```')
     const scanEnd = fence >= 0 ? fence : buf.length
+    if (scanEnd === 0) return -1
+
+    // 表格行和标题行必须独立成段。它们一个字都不念（表格）或者只是个小标题，
+    // 留在 buf 里会把后面的正文一起拖进同一段——实测「主要分三层：」+ 三行表格
+    // + 「### 关键实现」被攒成一段 182 字的字符串，既念了表格又断不开句
+    const boundary = buf.slice(0, scanEnd).search(/^[ \t]*(?:\||#{1,6}[ \t])/m)
+    if (boundary > 0) return boundary
+    if (boundary === 0) {
+      const nl = buf.indexOf('\n')
+      return nl >= 0 ? nl + 1 : -1
+    }
+
     const [minLen, target, hard] = this.first
       ? [MIN_FIRST, FIRST_TARGET, FIRST_HARD]
       : [MIN_NEXT, NEXT_TARGET, NEXT_HARD]
 
-    // 前一句切走后会留下前导空白（空行、缩进）。不排除的话它们会吃掉长度
-    // 预算：「\n\n主要分三层：」里的冒号会被当成第 8 个字，一句 6 个字的
-    // 短句就被切出来了
-    const lead = buf.length - buf.trimStart().length
-    const count = buf.length - lead
-    const lenAt = (i: number) => i + 1 - lead
+    // spoken[i] = 到下标 i（含）为止能念出来的字数。标点、markdown 符号、
+    // 路径、表格都跳到这一列不算——详见 silentRanges 的说明
+    const skip = silentRanges(buf, scanEnd)
+    const spoken = new Array<number>(scanEnd)
+    let n = 0
+    let k = 0
+    for (let i = 0; i < scanEnd; i += 1) {
+      while (k < skip.length && i >= skip[k][1]) k += 1
+      const muted = k < skip.length && i >= skip[k][0]
+      if (!muted && COUNTABLE.test(buf[i])) n += 1
+      spoken[i] = n
+    }
+    const lenAt = (i: number) => spoken[i] ?? 0
+    const count = lenAt(scanEnd - 1)
 
-    let winEnd = -1
-    let firstEnd = -1
-    let winSoft = -1
+    /** 切点连同后面的标点一起进上一句，否则下一句会以「，」开头 */
+    let winEnd: [number, number] | null = null
+    let firstEnd: [number, number] | null = null
+    let winSoft: [number, number] | null = null
     /** 越过 target 后的第一个逗号：句子带长路径/英文词时窗口内没有标点可用 */
-    let softAfter = -1
+    let softAfter: [number, number] | null = null
 
     // 切点不能越过围栏，否则围栏会和正文被切成同一段，判定成代码块后整段丢掉
     for (let i = 0; i < scanEnd; i += 1) {
       const ch = buf[i]
       const len = lenAt(i)
       if (len < minLen) continue
+      const cut = i + 1
       if (SENTENCE_END.includes(ch)) {
-        if (firstEnd < 0) firstEnd = len
-        if (len <= target) winEnd = len
+        if (!firstEnd) firstEnd = [cut, len]
+        if (len <= target) winEnd = [cut, len]
       } else if (SOFT_BREAK.includes(ch) && canCutAt(buf, i)) {
-        if (len <= target) winSoft = len
-        else if (softAfter < 0) softAfter = len
+        if (len <= target) winSoft = [cut, len]
+        else if (!softAfter) softAfter = [cut, len]
       }
+    }
+
+    /** 第 hard 个可念字之后的位置，整段没有标点时兜底用 */
+    const hardCut = () => {
+      for (let i = 0; i < scanEnd; i += 1) {
+        if (lenAt(i) >= hard) return i + 1
+      }
+      return scanEnd
     }
 
     if (this.first) {
       // 首句：第一个句号就走，最快出声
-      if (firstEnd > 0 && firstEnd <= hard) return firstEnd
-      if (count >= target && winSoft > 0) return winSoft
-      if (count >= hard) return Math.min(lead + hard, scanEnd)
+      if (firstEnd && firstEnd[1] <= hard) return firstEnd[0]
+      if (count >= target && winSoft) return winSoft[0]
+      if (count >= hard) return hardCut()
       return -1
     }
 
     // 后续句：优先切在窗口内的句号上（一层意思说完）
-    if (winEnd > 0) return winEnd
+    if (winEnd) return winEnd[0]
     if (count >= target) {
       // 句号太远：攒够 target 就退到逗号，别等一整段
-      if (winSoft > 0) return winSoft
+      if (winSoft) return winSoft[0]
       // 句号在 target 和 hard 之间：等它，比断在词中间自然
-      if (firstEnd > 0 && firstEnd <= hard) return firstEnd
+      if (firstEnd && firstEnd[1] <= hard) return firstEnd[0]
       // 一个标点都没落在窗口里：退到越过 target 后的第一个逗号，
       // 总比硬切在「这是一｜个」中间好
-      if (softAfter > 0 && softAfter <= hard) return softAfter
+      if (softAfter && softAfter[1] <= hard) return softAfter[0]
     }
-    if (count >= hard) return Math.min(lead + hard, scanEnd)
+    if (count >= hard) return hardCut()
     // 围栏就在后面，前面的正文又没标点：先交出正文，围栏留到下次
     if (fence > 0) return fence
     return -1
