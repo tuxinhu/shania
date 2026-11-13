@@ -138,7 +138,7 @@ function retry() {
     <div class="body">
       <div class="msg-head">
         <span class="avatar">
-          <Icon name="sparkles" :size="11" />
+          <Icon name="sparkles" :size="13" />
         </span>
         <span class="name">{{ name }}</span>
         <span class="meta">{{ time }}</span>
@@ -364,10 +364,10 @@ function retry() {
 }
 
 .avatar {
-  width: 18px;
-  height: 18px;
+  width: 22px;
+  height: 22px;
   flex: none;
-  border-radius: 6px;
+  border-radius: 7px;
   display: grid;
   place-items: center;
   color: #fff;

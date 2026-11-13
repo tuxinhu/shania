@@ -11,7 +11,7 @@
  */
 import path from 'node:path'
 
-const PORT = 9222
+const PORT = Number(process.env.CDP_PORT || 9222)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const extra = process.argv[2] || ''
 

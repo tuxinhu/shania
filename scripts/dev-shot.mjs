@@ -8,7 +8,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-const PORT = 9222
+// 端口可覆盖：9222 被别的 Chrome 占住时，用 CDP_PORT=9223 另起一个
+const PORT = Number(process.env.CDP_PORT || 9222)
 const APP_URL = 'http://localhost:1420'
 const outFile = process.argv[2] || '.preview/shot.png'
 const mode = process.argv[3] || 'chat'
