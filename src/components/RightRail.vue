@@ -9,7 +9,7 @@
  * 终端没有面板：直接拉起系统终端（工作目录 = 工作空间），比在里面养一个
  * xterm 实例划算得多。
  */
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import Icon from './Icon.vue'
 import ResizeHandle from './ResizeHandle.vue'
 import BrowserPanel from './panels/BrowserPanel.vue'
@@ -17,8 +17,6 @@ import ChangesPanel from './panels/ChangesPanel.vue'
 import FilesPanel from './panels/FilesPanel.vue'
 import { getWorkspaceRoot, openTerminal, setWorkspaceRoot } from '@/lib/workspace'
 import { isTauri } from '@/lib/api'
-
-const RAIL_W = 46
 
 type ToolId = 'browser' | 'files' | 'changes'
 
@@ -34,24 +32,13 @@ const error = ref('')
 
 /** 终端点击后的短暂反馈：拉起外部窗口没有回调，只能给个视觉确认 */
 const flash = ref(false)
+const toast = ref('')
 
 const current = computed(() => tools.find((t) => t.id === active.value) ?? null)
 
 function toggle(id: ToolId) {
   active.value = active.value === id ? null : id
 }
-
-/**
- * 对话列做「视觉居中」时要拿右侧占用的总宽参与计算（ChatPanel 的 clamp 里
- * 引用 --rail-w），所以面板开合就在这里同步一次；拖宽面板后这个 calc 会
- * 自动跟随，不用重复上报。
- */
-watch(active, (value) => {
-  document.documentElement.style.setProperty(
-    '--rail-w',
-    value ? `calc(${RAIL_W}px + var(--rail-panel-w, 420px))` : `${RAIL_W}px`,
-  )
-})
 
 async function reloadRoot() {
   try {
@@ -73,13 +60,32 @@ async function pickRoot() {
   }
 }
 
+let toastTimer: ReturnType<typeof setTimeout> | null = null
+
+function say(text: string) {
+  toast.value = text
+  if (toastTimer) clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => (toast.value = ''), 2600)
+}
+
+/**
+ * 拉起终端。
+ *
+ * 一定要给反馈：外部窗口是别的进程，开没开成功前端拿不到回调。之前失败时
+ * 只往面板头部塞一句红字，可面板没开的时候根本看不见——用户看到的就是
+ * 「点了终端没反应，这功能是不是没做」。
+ */
 async function terminal() {
   try {
-    await openTerminal(root.value)
+    const app = await openTerminal(root.value)
     flash.value = true
     setTimeout(() => (flash.value = false), 700)
+    say(`已在 ${app} 打开 ${root.value || '工作空间'}`)
+    error.value = ''
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err)
+    const text = err instanceof Error ? err.message : String(err)
+    error.value = text
+    say(`打开终端失败：${text}`)
   }
 }
 
@@ -141,6 +147,10 @@ onMounted(reloadRoot)
         <Icon name="terminal" :size="17" />
       </button>
     </nav>
+
+    <Transition name="rail-toast">
+      <div v-if="toast" class="rail-toast">{{ toast }}</div>
+    </Transition>
   </div>
 </template>
 
@@ -154,7 +164,8 @@ onMounted(reloadRoot)
 
 /* ---------- 面板 ---------- */
 .panel {
-  width: var(--rail-panel-w, 420px);
+  /* 42vw 是兜底：窗口被拖窄时固定 420 会吃掉一半，对话区只剩几十像素 */
+  width: min(var(--rail-panel-w, 420px), 42vw);
   flex: none;
   display: flex;
   flex-direction: column;
@@ -262,5 +273,33 @@ onMounted(reloadRoot)
 .rail-btn.flash {
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+/* ---------- 结果提示 ---------- */
+/* 固定贴在工具条左侧：面板开合、对话滚动都不影响它 */
+.rail-toast {
+  position: fixed;
+  right: 58px;
+  bottom: 18px;
+  z-index: 60;
+  max-width: 340px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-md);
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.5;
+  pointer-events: none;
+}
+.rail-toast-enter-active,
+.rail-toast-leave-active {
+  transition: opacity 0.18s var(--ease), transform 0.18s var(--ease);
+}
+.rail-toast-enter-from,
+.rail-toast-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
 }
 </style>

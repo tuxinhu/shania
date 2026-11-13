@@ -207,10 +207,17 @@ pub fn workspace_open(path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 在工作空间里拉起终端。优先 Windows Terminal（有标签页、能记住上次目录），
-/// 没装就退回 cmd。
+/// 在工作空间里拉起终端。
+///
+/// 按 Windows Terminal → PowerShell 7 → Windows PowerShell → cmd 依次尝试，
+/// 返回实际用上的那个名字，前端据此给一句确认（拉起外部窗口没有回调，
+/// 不给反馈用户根本分不清是「开了没反应」还是「压根没执行」）。
+///
+/// 注意：这几步都**不能**加 CREATE_NO_WINDOW。那个标志会被子进程继承，
+/// 终端窗口会整个起不来——表现出来就是「点了终端没反应」。git 那类控制台
+/// 程序的 `quiet()` 是另一回事，那里要的恰恰是别闪黑框。
 #[tauri::command]
-pub fn workspace_terminal(path: String) -> Result<(), String> {
+pub fn workspace_terminal(path: String) -> Result<String, String> {
     let dir = {
         let p = PathBuf::from(&path);
         if p.is_dir() {
@@ -222,32 +229,52 @@ pub fn workspace_terminal(path: String) -> Result<(), String> {
 
     #[cfg(windows)]
     {
-        // 注意：这里**不能**用 CREATE_NO_WINDOW。wt 是 GUI 程序，本来就不会闪
-        // 控制台；而那个标志会被子进程继承，Windows Terminal 的窗口会整个起
-        // 不来——表现为「点了终端没反应」。
+        // -d 指定起始目录。wt 有标签页，会复用已开的窗口
         let mut wt = Command::new("wt");
         wt.arg("-d").arg(&dir);
         if wt.spawn().is_ok() {
-            return Ok(());
+            return Ok("Windows Terminal".into());
         }
 
-        // wt 不在 PATH（Win10 默认没装）：走 cmd 的 start。中间这层 cmd 自己
-        // 会闪一下黑框，无伤大雅——反正马上要开的就是个终端窗口。
-        let mut fallback = Command::new("cmd");
-        fallback
-            .args(["/c", "start", "", "cmd", "/k"])
-            .arg(format!("cd /d \"{}\"", dir.display()));
-        fallback.spawn().map_err(|e| format!("启动终端失败：{e}"))?;
+        // PowerShell 7（pwsh）没装是常态，装了的话箭头/编码体验比 cmd 好
+        let mut pwsh = Command::new("pwsh");
+        pwsh.args(["-NoExit", "-Command"]).arg(format!(
+            "Set-Location -LiteralPath \"{}\"",
+            dir.display()
+        ));
+        if pwsh.spawn().is_ok() {
+            return Ok("PowerShell 7".into());
+        }
+
+        let mut ps = Command::new("powershell");
+        ps.args(["-NoExit", "-Command"]).arg(format!(
+            "Set-Location -LiteralPath \"{}\"",
+            dir.display()
+        ));
+        if ps.spawn().is_ok() {
+            return Ok("Windows PowerShell".into());
+        }
+
+        // 最后兜底：cmd 自己就是控制台程序，直接起窗口，/k 让窗口留着别闪退。
+        // 之前套了一层 `cmd /c start "" cmd /k "cd /d ..."`，多出来的引号会被
+        // 拆得七零八落，目录进不去——直接 spawn 反而干净。
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/k").arg("cd").arg("/d").arg(&dir);
+        cmd.spawn()
+            .map_err(|e| format!("启动终端失败：{e}"))?;
+        Ok("命令提示符".into())
     }
 
     #[cfg(not(windows))]
     {
-        let mut cmd = Command::new("open");
-        cmd.arg("-a").arg("Terminal").arg(&dir);
-        cmd.spawn().map_err(|e| format!("启动终端失败：{e}"))?;
+        Command::new("open")
+            .arg("-a")
+            .arg("Terminal")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("启动终端失败：{e}"))?;
+        Ok("Terminal".into())
     }
-
-    Ok(())
 }
 
 #[derive(Serialize)]

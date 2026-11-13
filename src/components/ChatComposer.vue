@@ -740,14 +740,18 @@ defineExpose({ setDraft, focus: focusInput })
 <style scoped>
 .composer {
   flex: none;
-  padding: 8px 24px 16px;
+  /* 水平内边距交给 .composer-inner：外层留白会让它和消息列的中轴对不上 */
+  padding: 8px 0 16px;
   background: linear-gradient(to top, var(--content) 62%, transparent);
 }
 
 .composer-inner {
   position: relative;
-  max-width: 800px;
-  margin: 0 auto;
+  /* 和 .inner 同一组变量（ChatPanel 的 syncDialogVars 写的），两边严丝合缝对齐 */
+  width: var(--col-w, 800px);
+  max-width: 100%;
+  margin-left: var(--col-left, 0px);
+  padding: 0 28px;
 }
 
 /* ---------- 附件预览 ---------- */

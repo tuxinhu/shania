@@ -47,10 +47,10 @@ export async function openPath(path: string): Promise<void> {
   await invoke('workspace_open', { path })
 }
 
-/** 在工作空间里拉起终端（Windows Terminal，没装则 cmd） */
-export async function openTerminal(path: string): Promise<void> {
+/** 在工作空间里拉起终端，返回实际拉起的终端名字（Windows Terminal / 命令提示符…） */
+export async function openTerminal(path: string): Promise<string> {
   requireDesktop()
-  await invoke('workspace_terminal', { path })
+  return invoke<string>('workspace_terminal', { path })
 }
 
 export async function gitChanges(path: string): Promise<GitChange[]> {

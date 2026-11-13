@@ -75,8 +75,11 @@ await send('Emulation.setDeviceMetricsOverride', {
   deviceScaleFactor: 1,
   mobile: false,
 })
-// 每次从干净会话开始，避免历史数据干扰截图
-await evaluate("localStorage.removeItem('shania.sessions')")
+// 每次从干净会话开始，避免历史数据干扰截图；顺手把拖出来的栏宽复位，
+// 否则同一个 profile 里连拍几张，宽度会跟着上次拖拽漂移
+await evaluate(
+  "['shania.sessions','shania.sidebarW','shania.railPanelW'].forEach((k)=>localStorage.removeItem(k))",
+)
 await send('Page.reload', { ignoreCache: false })
 await sleep(1600)
 
