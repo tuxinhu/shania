@@ -747,10 +747,10 @@ defineExpose({ setDraft, focus: focusInput })
 
 .composer-inner {
   position: relative;
-  /* 和 .inner 同一组变量（ChatPanel 的 syncDialogVars 写的），两边严丝合缝对齐 */
-  width: var(--col-w, 800px);
-  max-width: 100%;
-  margin-left: var(--col-left, 0px);
+  /* 与 .inner 同样的宽度与居中规则，两边落在同一条中轴上 */
+  width: 100%;
+  max-width: 800px;
+  margin: 0 auto;
   padding: 0 28px;
 }
 

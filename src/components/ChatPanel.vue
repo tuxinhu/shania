@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import ChatComposer from './ChatComposer.vue'
 import EmptyState from './EmptyState.vue'
 import Icon from './Icon.vue'
@@ -87,70 +87,7 @@ watch(
 onMounted(() => {
   void toBottom()
   composer.value?.focus()
-
-  // 消息列的居中补偿要拿「对话区有多宽」参与 clamp，宽度和列宽都得动态上报
-  syncDialogVars()
-  dialogObserver = new ResizeObserver(syncDialogVars)
-  if (scroller.value) dialogObserver.observe(scroller.value)
-  window.addEventListener('resize', syncDialogVars)
 })
-
-onUnmounted(() => {
-  dialogObserver?.disconnect()
-  window.removeEventListener('resize', syncDialogVars)
-})
-
-/**
- * 算出对话列的宽度和水平偏移，写成 CSS 变量给消息区与输入框共用。
- *
- * 为什么不能在 CSS 里用 `margin: 0 auto`：
- * 对话区两侧宽度不对称（侧栏 268 / 工具条 46），在「对话区」里居中的结果，
- * 放到整个窗口去看就是偏右 111px —— 左边留白比右边宽一大截，正是肉眼看到的
- * 「没居中」。所以要以**窗口中轴**为基准来定位。
- *
- * 为什么不用纯 CSS 的 clamp 补偿：窗口越窄，对话区里能挪的余量越小，而理想的
- * 补偿是固定 111px，clamp 一到边界就失效，列会直接贴住侧栏。这里改成让**列宽
- * 自己让位**：列宽上限同时受「窗口左右各留出侧栏宽度」约束，列窄一点，两边
- * 留白才能真正相等。
- *
- * 输入框和消息区拿同一组变量，才不会出现「消息偏左、输入框还在原处」的错位。
- */
-let dialogObserver: ResizeObserver | null = null
-
-const MAX_COL = 800
-const MIN_COL = 520
-/** 列与对话区边缘的最小间隙，窄窗口时别让内容贴边 */
-const EDGE = 24
-/** 列与侧栏之间要留的空隙：区域对称了还不够，贴着侧栏看着照样挤 */
-const GAP = 48
-
-function syncDialogVars() {
-  const el = scroller.value
-  if (!el) return
-  // 设置页打开时整个会话页被 v-show 隐藏，宽度是 0，算出来全是垃圾值
-  const pane = el.clientWidth
-  if (pane < 80) return
-
-  const side = document.querySelector('.sidebar')?.getBoundingClientRect().width ?? 268
-  const railEl = document.querySelector('.right')
-  const rail = railEl ? railEl.getBoundingClientRect().width : 46
-  const win = side + pane + rail
-
-  // 想在窗口里居中，两侧留白必须都 ≥ 侧栏宽 + 空隙（左侧要被侧栏占掉）
-  let col = Math.min(MAX_COL, win - (side + GAP) * 2)
-  col = Math.max(col, MIN_COL)
-  col = Math.min(col, pane - EDGE * 2)
-
-  // 窗口居中所需的偏移；放不下就退回「对话区内居中」——
-  // 直接钳到边界的话，列会紧贴着侧栏或右侧面板，比不居中更难看
-  const centered = (win - col) / 2 - side
-  const maxLeft = Math.max(pane - col, 0)
-  const left = centered < 0 || centered > maxLeft ? maxLeft / 2 : centered
-
-  const rootStyle = document.documentElement.style
-  rootStyle.setProperty('--col-w', `${Math.round(col)}px`)
-  rootStyle.setProperty('--col-left', `${Math.round(left)}px`)
-}
 
 function pick(text: string) {
   composer.value?.setDraft(text)
@@ -310,13 +247,16 @@ function pick(text: string) {
   overflow-x: hidden;
   min-height: 0;
   scroll-behavior: auto;
+  /* 两侧都预留滚动条的位置：否则滚动条一出现，内容区左移 5px，
+     而下面的输入框没有滚动条不动，两者的中轴就错开了 */
+  scrollbar-gutter: stable both-edges;
 }
 
 .inner {
-  /* 宽度和偏移由 syncDialogVars 算好：以窗口中轴为基准，输入框共用同一组变量 */
-  width: var(--col-w, 800px);
-  max-width: 100%;
-  margin-left: var(--col-left, 0px);
+  /* 在 .main 里居中：两侧留白自然相等，跟左侧栏、右侧工具条的宽度无关 */
+  width: 100%;
+  max-width: 800px;
+  margin: 0 auto;
   min-height: 100%;
   padding: 26px 28px 10px;
   display: flex;
