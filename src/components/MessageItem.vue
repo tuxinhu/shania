@@ -135,12 +135,11 @@ function retry() {
   </div>
 
   <div v-else class="msg assistant" :data-mid="message.id">
-    <div class="avatar">
-      <Icon name="sparkles" :size="13" />
-    </div>
-
     <div class="body">
       <div class="msg-head">
+        <span class="avatar">
+          <Icon name="sparkles" :size="11" />
+        </span>
         <span class="name">{{ name }}</span>
         <span class="meta">{{ time }}</span>
         <span v-if="message.model" class="meta dot-sep">{{ message.model }}</span>
@@ -358,18 +357,17 @@ function retry() {
 }
 
 /* ---------- 助手 ---------- */
+/* 头像跟着名字走，不单独占左侧一列：否则正文会被挤到图标右边 37px，
+   跟图标不在同一个左边界上。现在正文、消息头、工具卡片全是同一条竖线 */
 .msg.assistant {
-  display: flex;
-  gap: 11px;
-  align-items: flex-start;
+  display: block;
 }
 
 .avatar {
-  width: 26px;
-  height: 26px;
+  width: 18px;
+  height: 18px;
   flex: none;
-  margin-top: 1px;
-  border-radius: 8px;
+  border-radius: 6px;
   display: grid;
   place-items: center;
   color: #fff;
@@ -378,16 +376,20 @@ function retry() {
 }
 
 .body {
-  flex: 1;
   min-width: 0;
-  padding-top: 1px;
 }
 
 .msg-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   margin-bottom: 5px;
+}
+
+/* 头像比文字高，跟第一行垂直居中对齐；字号不同的 name / meta 也走 center，
+   基线对齐会让 10.5px 的 meta 明显下沉 */
+.msg-head .avatar {
+  margin-right: 1px;
 }
 
 .name {
